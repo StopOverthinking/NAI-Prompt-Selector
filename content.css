@@ -1,9 +1,17 @@
+.nai-toolbar-highlight,
 .nai-pm-history-highlight {
   outline: 2px solid #27d6c4 !important;
   outline-offset: -2px !important;
   box-shadow: 0 0 0 1px rgba(6, 9, 12, 0.72), 0 0 18px rgba(39, 214, 196, 0.5) !important;
 }
 
+.nai-pm-enhance-source-highlight {
+  outline: 2px solid #ffb347 !important;
+  outline-offset: -2px !important;
+  box-shadow: 0 0 0 1px rgba(41, 16, 61, 0.76), 0 0 18px rgba(181, 108, 255, 0.5) !important;
+}
+
+.nai-toolbar-highlight-marker,
 .nai-pm-highlight-marker {
   position: absolute;
   top: 0;
@@ -13,5 +21,20 @@
   border-top: 22px solid #27d6c4;
   border-right: 22px solid transparent;
   z-index: 2147483000;
+  pointer-events: none;
+}
+
+.nai-pm-enhance-source-marker {
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 14px;
+  height: 14px;
+  border: 2px solid rgba(255, 255, 255, 0.92);
+  border-radius: 3px;
+  background: linear-gradient(135deg, #ffb347 0%, #b56cff 100%);
+  box-shadow: 0 0 0 1px rgba(41, 16, 61, 0.8), 0 0 10px rgba(255, 179, 71, 0.6);
+  transform: rotate(45deg);
+  z-index: 2147483001;
   pointer-events: none;
 }

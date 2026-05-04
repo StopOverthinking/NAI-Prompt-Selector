@@ -18,6 +18,9 @@
   const ONE_CLICK_TIMEOUT_MS = 10 * 60 * 1000;
   const PANEL_POSITION_MARGIN = 8;
   const PANEL_EDGE_ANCHOR_DISTANCE = 24;
+  const HISTORY_ITEM_SELECTOR = 'div[role="button"][draggable="true"]';
+  const ENHANCE_SOURCE_REAPPLY_DELAYS_MS = [0, 300, 1000];
+  const ENHANCE_SOURCE_OBSERVE_MS = 2000;
 
   const MAIN_BASE_SLOT_ID = "main.base";
   const MAIN_UC_SLOT_ID = "main.uc";
@@ -52,6 +55,10 @@
   const textareaVerticalCaretMemory = new WeakMap();
   let suppressCharacterReconcileUntil = 0;
   let suppressCharacterActionTrackingUntil = 0;
+  let lastClickedHistoryItem = null;
+  let lastKnownHistorySource = null;
+  let enhanceHighlightToken = 0;
+  let enhanceHistoryObserver = null;
 
   const autoRun = {
     active: false,
@@ -1609,23 +1616,22 @@
   }
 
   function findHistoryItems() {
-    const container = findHistoryContainer();
-    const root = container || document;
-    const candidates = Array.from(root.querySelectorAll('div[role="button"][draggable="true"], div[role="button"], button, [draggable="true"]'))
-      .filter((element) => element instanceof HTMLElement)
-      .filter(isVisible)
-      .filter((element) => element.querySelector("img"));
-
-    const seen = new Set();
-    const items = [];
-    for (const candidate of candidates) {
-      const key = candidate;
-      if (!seen.has(key)) {
-        seen.add(key);
-        items.push(candidate);
-      }
+    const historyContainer = findHistoryContainer();
+    const root = historyContainer || document;
+    const primaryItems = historyContainer
+      ? Array.from(historyContainer.querySelectorAll(HISTORY_ITEM_SELECTOR))
+      : [];
+    if (primaryItems.length) {
+      return primaryItems;
     }
-    return items;
+
+    const candidates = Array.from(root.querySelectorAll(`${HISTORY_ITEM_SELECTOR}, [role="button"], button, [draggable="true"]`))
+      .filter((element) => element instanceof HTMLElement)
+      .filter((element) => !element.closest("#nai-prompt-selector-host"))
+      .filter(isVisible)
+      .filter((element) => element.querySelector("img") || getImageUrlCandidates(element).length > 0);
+
+    return candidates.filter((item, index) => candidates.indexOf(item) === index);
   }
 
   function findCurrentImage() {
@@ -1640,35 +1646,396 @@
     return images[0] || null;
   }
 
-  function clearAllHighlights() {
-    document.querySelectorAll(".nai-pm-highlight-marker").forEach((marker) => marker.remove());
-    document.querySelectorAll(".nai-pm-history-highlight").forEach((item) => {
-      item.classList.remove("nai-pm-history-highlight");
-      if (item.dataset.naiPmOriginalPosition) {
-        item.style.position = item.dataset.naiPmOriginalPosition === "static" ? "" : item.dataset.naiPmOriginalPosition;
-        delete item.dataset.naiPmOriginalPosition;
+  function isPromptSelectorEvent(event) {
+    if (!panelHost) {
+      return false;
+    }
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    return path.includes(panelHost) || panelHost.contains(event.target);
+  }
+
+  function normalizeImageUrl(url) {
+    const value = String(url || "").trim();
+    if (!value) {
+      return "";
+    }
+    try {
+      return new URL(value, location.href).href;
+    } catch (error) {
+      return value;
+    }
+  }
+
+  function addCssImageUrls(value, urls) {
+    const text = String(value || "");
+    const pattern = /url\((['"]?)(.*?)\1\)/g;
+    let match = pattern.exec(text);
+    while (match) {
+      const normalized = normalizeImageUrl(match[2]);
+      if (normalized) {
+        urls.add(normalized);
+      }
+      match = pattern.exec(text);
+    }
+  }
+
+  function getImageUrlCandidates(root) {
+    const urls = new Set();
+    const addImage = (image) => {
+      const currentSrc = normalizeImageUrl(image.currentSrc);
+      const src = normalizeImageUrl(image.src);
+      if (currentSrc) {
+        urls.add(currentSrc);
+      }
+      if (src) {
+        urls.add(src);
+      }
+    };
+
+    if (root instanceof HTMLImageElement) {
+      addImage(root);
+    }
+    if (root instanceof Element) {
+      root.querySelectorAll("img").forEach(addImage);
+      [root, ...Array.from(root.querySelectorAll("*"))].forEach((element) => {
+        addCssImageUrls(window.getComputedStyle(element).backgroundImage, urls);
+      });
+    }
+
+    return Array.from(urls);
+  }
+
+  function historyItemHasAnyUrl(item, sourceUrls) {
+    if (!sourceUrls?.size) {
+      return false;
+    }
+    return getImageUrlCandidates(item).some((url) => sourceUrls.has(url));
+  }
+
+  function findHistoryItemByImageUrls(items, urls) {
+    const sourceUrls = new Set((urls || []).map(normalizeImageUrl).filter(Boolean));
+    if (!sourceUrls.size) {
+      return null;
+    }
+    return items.find((item) => historyItemHasAnyUrl(item, sourceUrls)) || null;
+  }
+
+  function isSelectedHistoryItem(item) {
+    const ariaSelected = item.getAttribute("aria-selected");
+    const ariaCurrent = item.getAttribute("aria-current");
+    const dataSelected = item.getAttribute("data-selected");
+    const className = typeof item.className === "string" ? item.className : "";
+    return ariaSelected === "true"
+      || (ariaCurrent && ariaCurrent !== "false")
+      || (dataSelected && dataSelected !== "false")
+      || /\b(selected|active|current)\b/i.test(className);
+  }
+
+  function findSelectedHistoryItem(items = findHistoryItems()) {
+    return items.find(isSelectedHistoryItem) || null;
+  }
+
+  function isAvailableHistoryItem(item) {
+    return item instanceof HTMLElement
+      && findHistoryItems().includes(item)
+      && isVisible(item);
+  }
+
+  function createHistorySourceSnapshot(item, items = findHistoryItems()) {
+    if (!item) {
+      return null;
+    }
+    const index = items.indexOf(item);
+    return {
+      item,
+      urls: getImageUrlCandidates(item),
+      index,
+      historyCount: items.length,
+    };
+  }
+
+  function findHistoryItemFromTarget(target) {
+    if (!(target instanceof Element)) {
+      return null;
+    }
+    const directItem = target.closest(HISTORY_ITEM_SELECTOR);
+    const items = findHistoryItems();
+    if (directItem && items.includes(directItem)) {
+      return directItem;
+    }
+    return items.find((item) => item === target || item.contains(target)) || null;
+  }
+
+  function rememberHistoryItemClick(event) {
+    const item = findHistoryItemFromTarget(event.target);
+    if (item) {
+      lastClickedHistoryItem = item;
+      lastKnownHistorySource = createHistorySourceSnapshot(item);
+    }
+  }
+
+  function createEnhanceSourceDescriptor() {
+    const items = findHistoryItems();
+    const currentImageUrls = getImageUrlCandidates(findCurrentImage());
+    let sourceItem = findHistoryItemByImageUrls(items, currentImageUrls);
+    if (!sourceItem) {
+      sourceItem = findSelectedHistoryItem(items);
+    }
+    if (!sourceItem && isAvailableHistoryItem(lastClickedHistoryItem)) {
+      sourceItem = lastClickedHistoryItem;
+    }
+    if (!sourceItem && lastKnownHistorySource) {
+      sourceItem = findHistoryItemByImageUrls(items, lastKnownHistorySource.urls)
+        || (lastKnownHistorySource.item && items.includes(lastKnownHistorySource.item) ? lastKnownHistorySource.item : null);
+    }
+
+    const sourceSnapshot = createHistorySourceSnapshot(sourceItem, items) || lastKnownHistorySource;
+    return {
+      item: sourceSnapshot?.item || sourceItem,
+      currentImageUrls,
+      sourceItemUrls: sourceSnapshot?.urls || [],
+      sourceIndex: Number.isFinite(sourceSnapshot?.index) ? sourceSnapshot.index : -1,
+      initialHistoryCount: sourceSnapshot?.historyCount || items.length,
+    };
+  }
+
+  function findHistoryItemByShiftedIndex(items, descriptor) {
+    const sourceIndex = Number.parseInt(descriptor?.sourceIndex, 10);
+    const initialHistoryCount = Number.parseInt(descriptor?.initialHistoryCount, 10);
+    if (!Number.isFinite(sourceIndex) || sourceIndex < 0 || !Number.isFinite(initialHistoryCount) || initialHistoryCount <= 0) {
+      return null;
+    }
+    const insertedBeforeCount = Math.max(0, items.length - initialHistoryCount);
+    return items[sourceIndex + insertedBeforeCount] || items[sourceIndex] || null;
+  }
+
+  function resolveEnhanceSourceItem(descriptor) {
+    const items = findHistoryItems();
+    return findHistoryItemByImageUrls(items, descriptor.currentImageUrls)
+      || findHistoryItemByImageUrls(items, descriptor.sourceItemUrls)
+      || (descriptor.item && items.includes(descriptor.item) && isVisible(descriptor.item) ? descriptor.item : null)
+      || findHistoryItemByShiftedIndex(items, descriptor);
+  }
+
+  function ensureHighlightPosition(item) {
+    const computedStyle = window.getComputedStyle(item);
+    if (computedStyle.position === "static" && !item.dataset.originalPosition) {
+      item.dataset.originalPosition = "static";
+      item.style.position = "relative";
+    }
+  }
+
+  function applyEnhanceSourceHighlight(descriptor, token) {
+    if (token !== enhanceHighlightToken) {
+      return false;
+    }
+    const item = resolveEnhanceSourceItem(descriptor);
+    if (!item) {
+      return false;
+    }
+    const currentMarkedItem = document.querySelector(".nai-pm-enhance-source-highlight");
+    if (currentMarkedItem === item && item.querySelector(".nai-pm-enhance-source-marker")) {
+      return true;
+    }
+
+    clearAllHighlights({ preserveEnhanceToken: true });
+    ensureHighlightPosition(item);
+
+    const marker = document.createElement("div");
+    marker.className = "nai-pm-enhance-source-marker";
+    marker.title = "Enhance source image";
+    item.appendChild(marker);
+    item.classList.add("nai-pm-enhance-source-highlight");
+    return true;
+  }
+
+  function stopEnhanceHistoryObserver() {
+    if (!enhanceHistoryObserver) {
+      return;
+    }
+    enhanceHistoryObserver.observer?.disconnect();
+    if (enhanceHistoryObserver.timeoutId) {
+      window.clearTimeout(enhanceHistoryObserver.timeoutId);
+    }
+    enhanceHistoryObserver = null;
+  }
+
+  function startEnhanceHistoryObserver(descriptor, token) {
+    if (!window.MutationObserver) {
+      return;
+    }
+    const historyContainer = findHistoryContainer();
+    if (!historyContainer) {
+      return;
+    }
+
+    stopEnhanceHistoryObserver();
+    let scheduled = false;
+    const observer = new MutationObserver(() => {
+      if (token !== enhanceHighlightToken) {
+        stopEnhanceHistoryObserver();
+        return;
+      }
+      if (scheduled) {
+        return;
+      }
+      scheduled = true;
+      window.requestAnimationFrame(() => {
+        scheduled = false;
+        applyEnhanceSourceHighlight(descriptor, token);
+      });
+    });
+    observer.observe(historyContainer, {
+      childList: true,
+      subtree: true,
+      attributes: true,
+      attributeFilter: ["class", "aria-selected", "aria-current", "data-selected", "style"],
+    });
+
+    const timeoutId = window.setTimeout(() => {
+      if (enhanceHistoryObserver?.observer === observer) {
+        stopEnhanceHistoryObserver();
+      }
+    }, ENHANCE_SOURCE_OBSERVE_MS);
+    enhanceHistoryObserver = { observer, timeoutId };
+  }
+
+  function isEnhanceButton(element) {
+    if (!(element instanceof Element)) {
+      return false;
+    }
+    const values = [
+      element.textContent,
+      element.getAttribute("aria-label"),
+      element.getAttribute("title"),
+    ].map((value) => String(value || "").trim().replace(/\s+/g, " "));
+    return values.some((value) => /\bEnhance\b/i.test(value));
+  }
+
+  function handleEnhanceClick(event) {
+    if (isPromptSelectorEvent(event)) {
+      return false;
+    }
+    const button = event.target instanceof Element
+      ? event.target.closest('button, [role="button"]')
+      : null;
+    if (!isEnhanceButton(button)) {
+      return false;
+    }
+
+    const descriptor = createEnhanceSourceDescriptor();
+    stopEnhanceHistoryObserver();
+    enhanceHighlightToken += 1;
+    const token = enhanceHighlightToken;
+    let hasHighlighted = false;
+    clearAllHighlights({ preserveEnhanceToken: true });
+    startEnhanceHistoryObserver(descriptor, token);
+
+    ENHANCE_SOURCE_REAPPLY_DELAYS_MS.forEach((delayMs, index) => {
+      const run = () => {
+        if (token !== enhanceHighlightToken) {
+          return;
+        }
+        if (applyEnhanceSourceHighlight(descriptor, token)) {
+          hasHighlighted = true;
+        } else if (index === ENHANCE_SOURCE_REAPPLY_DELAYS_MS.length - 1 && !hasHighlighted) {
+          setStatus("Enhance 원본 히스토리 항목을 찾지 못했습니다.", "warn");
+        }
+      };
+      if (delayMs > 0) {
+        window.setTimeout(run, delayMs);
+      } else {
+        run();
+      }
+    });
+    return true;
+  }
+
+  function clearAllHighlights({ preserveEnhanceToken = false } = {}) {
+    if (!preserveEnhanceToken) {
+      enhanceHighlightToken += 1;
+      stopEnhanceHistoryObserver();
+    }
+    const markers = document.querySelectorAll(".nai-toolbar-highlight-marker, .nai-pm-highlight-marker, .nai-pm-enhance-source-marker");
+    markers.forEach((element) => element.remove());
+
+    const previousHighlights = document.querySelectorAll(".nai-toolbar-highlight, .nai-pm-history-highlight, .nai-pm-enhance-source-highlight");
+    previousHighlights.forEach((element) => {
+      element.classList.remove("nai-toolbar-highlight", "nai-pm-history-highlight", "nai-pm-enhance-source-highlight");
+      if (element.dataset.originalPosition) {
+        element.style.position = element.dataset.originalPosition;
+        delete element.dataset.originalPosition;
+      }
+      if (element.dataset.naiPmOriginalPosition) {
+        element.style.position = element.dataset.naiPmOriginalPosition === "static" ? "" : element.dataset.naiPmOriginalPosition;
+        delete element.dataset.naiPmOriginalPosition;
       }
     });
   }
 
   function highlightRecentHistory(count) {
+    const safeCount = Math.max(0, Number.parseInt(count, 10) || 0);
     clearAllHighlights();
-    const items = findHistoryItems();
-    for (let index = 0; index < count && index < items.length; index += 1) {
+    if (!safeCount) {
+      return;
+    }
+
+    const historyContainer = document.getElementById("historyContainer");
+    if (!historyContainer) {
+      return;
+    }
+
+    const items = Array.from(historyContainer.querySelectorAll(HISTORY_ITEM_SELECTOR));
+    for (let index = 0; index < safeCount && index < items.length; index += 1) {
       const item = items[index];
-      const computedStyle = window.getComputedStyle(item);
-      if (computedStyle.position === "static") {
-        item.dataset.naiPmOriginalPosition = "static";
-        item.style.position = "relative";
-      } else if (!item.dataset.naiPmOriginalPosition) {
-        item.dataset.naiPmOriginalPosition = computedStyle.position;
-      }
+      ensureHighlightPosition(item);
 
       const marker = document.createElement("div");
-      marker.className = "nai-pm-highlight-marker";
+      marker.className = "nai-toolbar-highlight-marker";
+      marker.style.cssText = [
+        "position:absolute",
+        "top:0",
+        "left:0",
+        "width:0",
+        "height:0",
+        "border-top:20px solid #00b0f4",
+        "border-right:20px solid transparent",
+        "z-index:10",
+        "pointer-events:none",
+      ].join(";");
       item.appendChild(marker);
-      item.classList.add("nai-pm-history-highlight");
+      item.classList.add("nai-toolbar-highlight");
     }
+  }
+
+  function showAutoCompletionFeedback(count) {
+    highlightRecentHistory(count);
+    showCompletionOverlay(count);
+    chrome.runtime.sendMessage({ action: "showCompletionNotification", count });
+    setStatus(`자동 생성 완료: ${count}장`, "ok");
+  }
+
+  function waitForHistoryThenShowCompletion(count) {
+    const safeCount = Math.max(0, Number.parseInt(count, 10) || 0);
+    if (!safeCount) {
+      clearAllHighlights();
+      showAutoCompletionFeedback(0);
+      return;
+    }
+
+    let attempts = 0;
+    const initialHistoryCount = autoRun.initialHistoryCount;
+    const checkInterval = setInterval(() => {
+      attempts += 1;
+      const historyContainer = document.getElementById("historyContainer");
+      const currentCount = historyContainer
+        ? historyContainer.querySelectorAll(HISTORY_ITEM_SELECTOR).length
+        : 0;
+      if (currentCount >= initialHistoryCount + safeCount || attempts > 50) {
+        clearInterval(checkInterval);
+        showAutoCompletionFeedback(safeCount);
+      }
+    }, 200);
   }
 
   function showCompletionOverlay(count) {
@@ -1867,21 +2234,7 @@
     await storageSet("sync", { autoClickEnabled: false });
     renderAutoRunControls();
 
-    const waitForHistory = setInterval(() => {
-      const currentCount = findHistoryItems().length;
-      if (currentCount >= autoRun.initialHistoryCount + count) {
-        clearInterval(waitForHistory);
-        highlightRecentHistory(count);
-      }
-    }, 200);
-    setTimeout(() => {
-      clearInterval(waitForHistory);
-      highlightRecentHistory(count);
-    }, 10000);
-
-    showCompletionOverlay(count);
-    chrome.runtime.sendMessage({ action: "showCompletionNotification", count });
-    setStatus(`자동 생성 완료: ${count}장`, "ok");
+    waitForHistoryThenShowCompletion(count);
   }
 
   async function handleAutoProgress() {
@@ -4372,8 +4725,16 @@
     return false;
   });
 
+  document.addEventListener("pointerdown", (event) => {
+    rememberHistoryItemClick(event);
+  }, true);
+
   document.addEventListener("click", (event) => {
+    rememberHistoryItemClick(event);
     trackNovelAiCharacterActionClick(event);
+    if (handleEnhanceClick(event)) {
+      return;
+    }
     const button = event.target?.closest?.("button");
     if (button && /Generate\s+\d+\s+Image(s)?/i.test(button.textContent || "")) {
       clearAllHighlights();
