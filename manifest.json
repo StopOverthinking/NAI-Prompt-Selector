@@ -1,0 +1,54 @@
+{
+  "manifest_version": 3,
+  "name": "NAI-Prompt-Selector",
+  "version": "0.1.0",
+  "description": "Prompt selector, auto generation, completion notifications, and recent image highlights for NovelAI Image.",
+  "permissions": [
+    "activeTab",
+    "downloads",
+    "notifications",
+    "scripting",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://novelai.net/*"
+  ],
+  "action": {
+    "default_popup": "popup/popup.html"
+  },
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": [
+        "https://novelai.net/image*"
+      ],
+      "js": [
+        "prompt-core.js",
+        "content.js"
+      ],
+      "css": [
+        "content.css"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "icons": {
+    "16": "icons/icon16.png",
+    "32": "icons/icon32.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  },
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "assets/start.mp3",
+        "assets/stop.mp3"
+      ],
+      "matches": [
+        "https://novelai.net/*"
+      ]
+    }
+  ]
+}

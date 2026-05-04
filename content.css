@@ -1,0 +1,17 @@
+.nai-pm-history-highlight {
+  outline: 2px solid #27d6c4 !important;
+  outline-offset: -2px !important;
+  box-shadow: 0 0 0 1px rgba(6, 9, 12, 0.72), 0 0 18px rgba(39, 214, 196, 0.5) !important;
+}
+
+.nai-pm-highlight-marker {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 0;
+  height: 0;
+  border-top: 22px solid #27d6c4;
+  border-right: 22px solid transparent;
+  z-index: 2147483000;
+  pointer-events: none;
+}

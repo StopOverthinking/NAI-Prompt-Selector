@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NAI-Prompt-Selector</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <header class="header">
+      <h1>NAI-Prompt-Selector</h1>
+      <p id="pageStatus">페이지 확인 중...</p>
+    </header>
+
+    <main>
+      <section class="section">
+        <div class="section-title">PromptSelector</div>
+        <button id="openPanelBtn" type="button">페이지 패널 열기</button>
+        <button id="applySelectorBtn" type="button">전체 슬롯 적용</button>
+      </section>
+
+      <section class="section">
+        <div class="section-title">자동 생성 옵션</div>
+        <div class="row">
+          <label for="intervalInput">대기(초)</label>
+          <input id="intervalInput" type="number" min="0.1" step="0.1" placeholder="3">
+        </div>
+        <div class="row">
+          <label for="gcountInput">횟수</label>
+          <input id="gcountInput" type="number" min="0" step="1" placeholder="0">
+        </div>
+        <div class="preset-row" aria-label="생성 횟수 프리셋">
+          <button type="button" class="gcountPresetBtn" data-gcount="5">5</button>
+          <button type="button" class="gcountPresetBtn" data-gcount="10">10</button>
+          <button type="button" class="gcountPresetBtn" data-gcount="20">20</button>
+          <button type="button" class="gcountPresetBtn" data-gcount="30">30</button>
+          <button type="button" class="gcountPresetBtn" data-gcount="50">50</button>
+          <button type="button" class="gcountPresetBtn" data-gcount="100">100</button>
+        </div>
+        <label class="check-row">
+          <input id="autoSaveCheckbox" type="checkbox">
+          생성 완료 이미지 자동 저장
+        </label>
+        <div class="row">
+          <label for="volumeSlider">볼륨</label>
+          <input id="volumeSlider" type="range" min="0" max="100" step="1">
+          <span id="volumeValue">50%</span>
+        </div>
+      </section>
+
+      <section class="section">
+        <div class="section-title">생성</div>
+        <button id="oneClickBtn" class="primary" type="button">1회 생성</button>
+        <button id="autoStartBtn" class="primary" type="button">자동 생성</button>
+        <button id="cancelAutoBtn" class="danger" type="button">자동 생성 취소</button>
+        <p class="hint">페이지 단축키: Ctrl+Enter 자동 생성, Ctrl+Shift+X 취소</p>
+      </section>
+    </main>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
