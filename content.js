@@ -1946,12 +1946,22 @@
       || "";
     const numericCost = Number.parseInt(costText, 10);
     if (Number.isFinite(numericCost) && numericCost > 0) {
-      return `경고: 생성 비용이 ${numericCost} Anlas입니다. 비용이 0이 아니면 자동 생성을 시작하지 않습니다.`;
+      return `경고: 현재 생성 비용이 ${numericCost} Anlas입니다.`;
     }
     return "";
   }
 
-  function runSafetyChecks({ alertUser = true } = {}) {
+  function confirmAutoGenerationCost() {
+    const warning = checkGenerationCost();
+    if (!warning) {
+      return true;
+    }
+
+    setStatus(warning, "warn");
+    return confirm(`${warning}\n\n이 비용으로 자동 생성을 시작할까요?`);
+  }
+
+  function runSafetyChecks({ alertUser = true, allowNonZeroGenerationCost = false } = {}) {
     if (!location.href.startsWith("https://novelai.net/image")) {
       const message = "NovelAI 이미지 페이지에서만 사용할 수 있습니다.";
       setStatus(message, "warn");
@@ -1961,7 +1971,7 @@
       return false;
     }
 
-    const warning = checkUndesiredContent() || checkGenerationCost();
+    const warning = checkUndesiredContent() || (allowNonZeroGenerationCost ? "" : checkGenerationCost());
     if (warning) {
       setStatus(warning, "warn");
       if (alertUser) {
@@ -2584,7 +2594,12 @@
     return { ok: false, cancelled: true, error: "생성이 취소되었습니다." };
   }
 
-  async function clickGenerate({ useSelector = false, silent = false, shouldContinue = null } = {}) {
+  async function clickGenerate({
+    useSelector = false,
+    silent = false,
+    allowNonZeroGenerationCost = false,
+    shouldContinue = null,
+  } = {}) {
     const pendingApply = await waitForPendingPromptApply({ silent });
     if (!pendingApply.ok) {
       return pendingApply;
@@ -2593,7 +2608,7 @@
       return getGenerationCancelledResult();
     }
 
-    if (!runSafetyChecks({ alertUser: !silent })) {
+    if (!runSafetyChecks({ alertUser: !silent, allowNonZeroGenerationCost })) {
       return { ok: false, error: "Safety check failed." };
     }
 
@@ -2727,6 +2742,7 @@
     const result = await clickGenerate({
       useSelector: autoRun.useSelector,
       silent: true,
+      allowNonZeroGenerationCost: true,
       shouldContinue: () => autoRun.active && token === autoRun.token,
     });
     if (!result.ok) {
@@ -2773,7 +2789,7 @@
       if (!autoRun.active || token !== autoRun.token) {
         return;
       }
-      if (!runSafetyChecks({ alertUser: true })) {
+      if (!runSafetyChecks({ alertUser: true, allowNonZeroGenerationCost: true })) {
         await stopAutoGenerate({ playAudio: true });
         chrome.runtime.sendMessage({ action: "resetPopupButtons" });
         return;
@@ -2822,8 +2838,13 @@
       return pendingApply;
     }
 
-    if (!runSafetyChecks({ alertUser: true })) {
+    if (!runSafetyChecks({ alertUser: true, allowNonZeroGenerationCost: true })) {
       return { ok: false, error: "Safety check failed." };
+    }
+    if (!confirmAutoGenerationCost()) {
+      const message = "자동 생성을 취소했습니다.";
+      setStatus(message, "warn");
+      return { ok: false, cancelled: true, error: message };
     }
 
     await stopAutoGenerate({ playAudio: false, highlightGenerated: false });
@@ -6589,7 +6610,8 @@
     const scan = scanNovelAiPromptSlots();
     renderSlotButtons();
     const generateButton = findGenerateButton();
-    const warning = checkUndesiredContent() || checkGenerationCost();
+    const warning = checkUndesiredContent();
+    const costWarning = checkGenerationCost();
     if (warning) {
       setStatus(warning, "warn");
     } else if (!generateButton) {
@@ -6602,6 +6624,8 @@
       setStatus("현재 생성 완료를 기다린 뒤 자동 생성을 시작합니다.", "ok");
     } else if (autoRun.active) {
       setStatus(`자동 생성 진행 중: 완료 ${autoRun.completedCount} / ${formatAutoTarget(autoRun.target)}`, "ok");
+    } else if (costWarning) {
+      setStatus(costWarning, "warn");
     } else {
       setStatus(`NovelAI 페이지와 연결되었습니다. 캐릭터 ${scan.characters.length}개 감지.`, "ok");
     }
