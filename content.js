@@ -11,16 +11,34 @@
     console.error("[NAI-Prompt-Selector] prompt-core.js was not loaded.");
     return;
   }
+  const Store = window.NAIPromptStorage;
+  if (!Store) {
+    console.error("[NAI-Prompt-Selector] prompt-storage.js was not loaded.");
+    return;
+  }
 
   const SELECTOR_STORAGE_KEY = "naiPromptSelector.selector";
   const LEGACY_SELECTOR_STORAGE_KEY = "naiPromptManager.selector";
+  const SELECTOR_BACKUPS_STORAGE_KEY = "naiPromptSelector.selectorBackups";
+  const SELECTOR_LAST_GOOD_STORAGE_KEY = "naiPromptSelector.selectorLastGood";
   const AUTO_REFRESH_MS = 500;
   const ONE_CLICK_TIMEOUT_MS = 10 * 60 * 1000;
+  const PROMPT_APPLY_TIMEOUT_MS = 3000;
+  const PROMPT_APPLY_STABLE_MS = 160;
+  const PROMPT_APPLY_POLL_MS = 50;
+  const PROMPT_APPLY_FLUSH_MS = 180;
   const PANEL_POSITION_MARGIN = 8;
   const PANEL_EDGE_ANCHOR_DISTANCE = 24;
   const HISTORY_ITEM_SELECTOR = 'div[role="button"][draggable="true"]';
   const ENHANCE_SOURCE_REAPPLY_DELAYS_MS = [0, 300, 1000];
   const ENHANCE_SOURCE_OBSERVE_MS = 2000;
+  const AUTO_SETTINGS_KEYS = [
+    "intervalTime",
+    "gcount",
+    "autoSaveEnabled",
+    "volume",
+    "autoCompletionNotificationEnabled",
+  ];
 
   const MAIN_BASE_SLOT_ID = "main.base";
   const MAIN_UC_SLOT_ID = "main.uc";
@@ -70,9 +88,19 @@
     timeoutId: null,
     useSelector: false,
     waitingForCompletion: false,
+    waitingForExistingGeneration: false,
     ignoreReadyUntil: 0,
+    token: 0,
+  };
+  const autoHistoryHighlightWait = {
+    token: 0,
+    intervalId: null,
   };
   let pendingDeleteCharacterIndex = null;
+  let pendingStorageNotice = null;
+  let selectorSaveQueue = Promise.resolve();
+  let pendingPromptApply = null;
+  let editingCharacterNameIndex = null;
   let draggingCharacterIndex = null;
   let characterDropTargetIndex = null;
   let panelLayoutRequestId = 0;
@@ -84,22 +112,206 @@
     return new Promise((resolve) => setTimeout(resolve, ms));
   }
 
+  function waitForAnimationFrame() {
+    return new Promise((resolve) => {
+      if (typeof window.requestAnimationFrame === "function") {
+        window.requestAnimationFrame(() => resolve());
+        return;
+      }
+      window.setTimeout(resolve, 16);
+    });
+  }
+
+  function normalizeStoredText(value) {
+    return String(value || "").replace(/\r\n?/g, "\n").trim();
+  }
+
+  function normalizePromptApplyText(value) {
+    return normalizeStoredText(String(value || "").replace(/\u00a0/g, " "));
+  }
+
+  function getPromptApplyErrorMessage(error) {
+    if (error instanceof Error && error.message) {
+      return error.message;
+    }
+    return String(error || "프롬프트 적용 중 오류가 발생했습니다.");
+  }
+
+  async function waitForPromptApplyFlush() {
+    await waitForAnimationFrame();
+    await waitForAnimationFrame();
+    await delay(PROMPT_APPLY_FLUSH_MS);
+  }
+
+  async function waitForEditableTextSettled(editor, expectedText, { resolveEditor = null } = {}) {
+    const expected = normalizePromptApplyText(expectedText);
+    const startedAt = Date.now();
+    let matchedSince = 0;
+    let actual = "";
+    let currentEditor = editor;
+
+    while (Date.now() - startedAt <= PROMPT_APPLY_TIMEOUT_MS) {
+      const editorReady = currentEditor?.isConnected
+        && currentEditor instanceof HTMLElement
+        && isVisible(currentEditor);
+      if (!editorReady && typeof resolveEditor === "function") {
+        currentEditor = await resolveEditor();
+      }
+
+      if (currentEditor?.isConnected && currentEditor instanceof HTMLElement && isVisible(currentEditor)) {
+        actual = normalizePromptApplyText(htmlToPlainText(currentEditor.innerHTML));
+        if (actual === expected) {
+          if (!matchedSince) {
+            matchedSince = Date.now();
+          }
+          if (Date.now() - matchedSince >= PROMPT_APPLY_STABLE_MS) {
+            return { ok: true };
+          }
+        } else {
+          matchedSince = 0;
+        }
+      } else {
+        matchedSince = 0;
+        actual = "";
+      }
+      await delay(PROMPT_APPLY_POLL_MS);
+    }
+
+    return { ok: false, expected, actual };
+  }
+
+  function trackPromptApply(operation) {
+    const previousPromptApply = pendingPromptApply;
+    const promptApply = (async () => {
+      if (previousPromptApply) {
+        await previousPromptApply.catch(() => null);
+      }
+      return operation();
+    })()
+      .catch((error) => ({
+        ok: false,
+        error: getPromptApplyErrorMessage(error),
+      }))
+      .finally(() => {
+        if (pendingPromptApply === promptApply) {
+          pendingPromptApply = null;
+        }
+      });
+
+    pendingPromptApply = promptApply;
+    return promptApply;
+  }
+
+  async function waitForPendingPromptApply({ silent = false } = {}) {
+    let waited = false;
+    while (pendingPromptApply) {
+      const promptApply = pendingPromptApply;
+      if (!waited && !silent) {
+        setStatus("프롬프트 적용 완료를 기다린 뒤 생성을 시작합니다.", "ok");
+      }
+
+      const result = await promptApply;
+      waited = true;
+      if (!result?.ok) {
+        const message = result?.error || "프롬프트 적용이 완료되지 않아 생성을 시작하지 않았습니다.";
+        if (!silent) {
+          setStatus(message, "warn");
+        }
+        return { ok: false, error: message };
+      }
+    }
+
+    if (waited) {
+      await waitForPromptApplyFlush();
+    }
+    return { ok: true, waited };
+  }
+
+  function parseStoredObject(value) {
+    if (!value) {
+      return {};
+    }
+    try {
+      const parsed = typeof value === "string" ? JSON.parse(value) : value;
+      return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+    } catch (error) {
+      return {};
+    }
+  }
+
+  function hasStoredObjectKeys(value) {
+    return Object.keys(parseStoredObject(value)).length > 0;
+  }
+
+  function hasSlotPromptData(slot) {
+    return Boolean(
+      slot
+      && (
+        normalizeStoredText(slot.groupsDefinition)
+        || normalizeStoredText(slot.quickPrompt)
+        || hasStoredObjectKeys(slot.selectionState)
+        || hasStoredObjectKeys(slot.weightMemory)
+        || hasStoredObjectKeys(slot.suffixSelectionState)
+        || hasStoredObjectKeys(slot.suffixWeightMemory)
+      )
+    );
+  }
+
+  function getDefaultGroupsDefinitionForSlot(slotId) {
+    const parsed = parseSlotId(slotId);
+    if (parsed?.scope === "main") {
+      return parsed.kind === "uc"
+        ? Core.DEFAULT_NEGATIVE_GROUPS_DEFINITION
+        : Core.DEFAULT_GROUPS_DEFINITION;
+    }
+    return "";
+  }
+
+  function getSampleGroupsDefinitionForSlot(slotId) {
+    const parsed = parseSlotId(slotId);
+    if (parsed?.scope === "character") {
+      return parsed.kind === "prompt" ? Core.DEFAULT_CHARACTER_PROMPT_GROUPS_DEFINITION : "";
+    }
+    return getDefaultGroupsDefinitionForSlot(slotId);
+  }
+
+  function getDefaultGroupsDefinitionsBySlot() {
+    return {
+      [MAIN_BASE_SLOT_ID]: Core.DEFAULT_GROUPS_DEFINITION,
+      [MAIN_UC_SLOT_ID]: Core.DEFAULT_NEGATIVE_GROUPS_DEFINITION,
+      [makeCharacterSlotId(1, "prompt")]: Core.DEFAULT_CHARACTER_PROMPT_GROUPS_DEFINITION,
+      [makeCharacterSlotId(1, "uc")]: "",
+    };
+  }
+
   function storageGet(area, keys) {
     return new Promise((resolve) => {
-      chrome.storage[area].get(keys, (result) => resolve(result || {}));
+      chrome.storage[area].get(keys, (result) => {
+        if (chrome.runtime.lastError) {
+          console.warn("[NAI-Prompt-Selector] storage get failed:", chrome.runtime.lastError.message);
+          resolve({});
+          return;
+        }
+        resolve(result || {});
+      });
     });
   }
 
   function storageSet(area, values) {
     return new Promise((resolve) => {
-      chrome.storage[area].set(values, () => resolve());
+      chrome.storage[area].set(values, () => {
+        if (chrome.runtime.lastError) {
+          resolve({ ok: false, error: chrome.runtime.lastError.message });
+          return;
+        }
+        resolve({ ok: true });
+      });
     });
   }
 
   function createSlotData(slotId, overrides = {}) {
-    const isMainBase = slotId === MAIN_BASE_SLOT_ID;
     return {
-      groupsDefinition: isMainBase ? Core.DEFAULT_GROUPS_DEFINITION : "",
+      groupsDefinition: getDefaultGroupsDefinitionForSlot(slotId),
       selectionState: "{}",
       weightMemory: "{}",
       quickPrompt: "",
@@ -111,7 +323,7 @@
 
   function sanitizeSlotData(slotId, value = {}) {
     return createSlotData(slotId, {
-      groupsDefinition: String(value.groupsDefinition ?? (slotId === MAIN_BASE_SLOT_ID ? Core.DEFAULT_GROUPS_DEFINITION : "")),
+      groupsDefinition: String(value.groupsDefinition ?? getDefaultGroupsDefinitionForSlot(slotId)),
       selectionState: String(value.selectionState || "{}"),
       weightMemory: String(value.weightMemory || "{}"),
       quickPrompt: String(value.quickPrompt || ""),
@@ -169,9 +381,9 @@
 
     for (const [index, label] of Object.entries(value)) {
       const numericIndex = Number.parseInt(index, 10);
-      const normalizedLabel = String(label || "").trim();
+      const normalizedLabel = normalizeCharacterLabelValue(label);
       if (Number.isFinite(numericIndex) && numericIndex > 0 && normalizedLabel) {
-        labels[numericIndex] = normalizedLabel.slice(0, 48);
+        labels[numericIndex] = normalizedLabel;
       }
     }
     return labels;
@@ -252,17 +464,123 @@
     return nextState;
   }
 
+  function getSelectorMeaningfulOptions(options = {}) {
+    return {
+      ...options,
+      defaultGroupsDefinition: Core.DEFAULT_GROUPS_DEFINITION,
+      defaultCharacterPromptGroupsDefinition: Core.DEFAULT_CHARACTER_PROMPT_GROUPS_DEFINITION,
+      defaultGroupsDefinitions: getDefaultGroupsDefinitionsBySlot(),
+    };
+  }
+
+  function migrateOptionalSelectorState(value) {
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? migrateStoredSelectorState(value)
+      : null;
+  }
+
+  function reportStorageNotice(message, tone = "warn") {
+    pendingStorageNotice = message;
+    setStatus(message, tone);
+  }
+
   async function loadSelectorState() {
-    const result = await storageGet("local", [SELECTOR_STORAGE_KEY, LEGACY_SELECTOR_STORAGE_KEY]);
+    const result = await storageGet("local", [
+      SELECTOR_STORAGE_KEY,
+      LEGACY_SELECTOR_STORAGE_KEY,
+      SELECTOR_LAST_GOOD_STORAGE_KEY,
+    ]);
     const storedState = result[SELECTOR_STORAGE_KEY] || result[LEGACY_SELECTOR_STORAGE_KEY] || {};
-    selectorState = migrateStoredSelectorState(storedState);
+    const migratedState = migrateStoredSelectorState(storedState);
+    const migratedLastGood = migrateOptionalSelectorState(result[SELECTOR_LAST_GOOD_STORAGE_KEY]);
+    const meaningfulOptions = getSelectorMeaningfulOptions();
+
+    if (
+      migratedLastGood
+      && !Store.isMeaningfulSelectorState(migratedState, meaningfulOptions)
+      && Store.isMeaningfulSelectorState(migratedLastGood, meaningfulOptions)
+    ) {
+      selectorState = migratedLastGood;
+      pendingStorageNotice = "현재 저장값이 비어 있어 마지막 정상 프롬프트 상태를 복구했습니다.";
+      await saveSelectorState({ reason: "recover-last-good", explicit: true, skipBackup: true });
+      return;
+    }
+
+    selectorState = migratedState;
     if (!result[SELECTOR_STORAGE_KEY] && result[LEGACY_SELECTOR_STORAGE_KEY]) {
-      await saveSelectorState();
+      await saveSelectorState({ reason: "migrate-legacy-selector", explicit: true, skipBackup: true });
     }
   }
 
-  function saveSelectorState() {
-    return storageSet("local", { [SELECTOR_STORAGE_KEY]: selectorState });
+  async function commitSelectorState(options = {}) {
+    const {
+      explicit = false,
+      forceBackup = false,
+      reason = "autosave",
+      skipBackup = false,
+    } = options;
+    const result = await storageGet("local", [
+      SELECTOR_STORAGE_KEY,
+      SELECTOR_BACKUPS_STORAGE_KEY,
+      SELECTOR_LAST_GOOD_STORAGE_KEY,
+    ]);
+    const previousSelector = migrateStoredSelectorState(result[SELECTOR_STORAGE_KEY] || {});
+    const previousLastGood = migrateOptionalSelectorState(result[SELECTOR_LAST_GOOD_STORAGE_KEY]);
+    const meaningfulOptions = getSelectorMeaningfulOptions({ explicit });
+    let nextSelector = Store.cloneJson(selectorState);
+
+    if (Store.shouldBlockEmptyRegression(previousSelector, nextSelector, meaningfulOptions)) {
+      if (previousLastGood && Store.isMeaningfulSelectorState(previousLastGood, meaningfulOptions)) {
+        selectorState = previousLastGood;
+        nextSelector = Store.cloneJson(selectorState);
+        reportStorageNotice("빈 프롬프트 상태로 덮어쓰려는 저장을 막고 마지막 정상 상태를 복구했습니다.");
+        updateEditorFieldsFromActiveSlot();
+        renderSlotButtons();
+        renderPromptSelector();
+      } else {
+        reportStorageNotice("빈 프롬프트 상태로 덮어쓰려는 저장을 막았습니다. JSON 내보내기나 백업 복구를 확인하세요.");
+        return { ok: false, error: "빈 프롬프트 상태로의 후퇴를 차단했습니다." };
+      }
+    }
+
+    let backups = Array.isArray(result[SELECTOR_BACKUPS_STORAGE_KEY])
+      ? result[SELECTOR_BACKUPS_STORAGE_KEY]
+      : [];
+    const shouldBackup = !skipBackup && (
+      forceBackup
+      || Store.shouldCreateAutomaticBackup(previousSelector, nextSelector, meaningfulOptions)
+    );
+    if (shouldBackup && Store.isMeaningfulSelectorState(previousSelector, meaningfulOptions)) {
+      backups = Store.appendBackup(
+        backups,
+        Store.createBackupSnapshot(previousSelector, { reason }),
+        { limit: Store.DEFAULT_BACKUP_LIMIT },
+      );
+    }
+
+    const nextLastGood = Store.selectLastGoodSelector(nextSelector, previousLastGood, meaningfulOptions);
+    const values = {
+      [SELECTOR_STORAGE_KEY]: nextSelector,
+      [SELECTOR_BACKUPS_STORAGE_KEY]: backups,
+    };
+    if (nextLastGood) {
+      values[SELECTOR_LAST_GOOD_STORAGE_KEY] = nextLastGood;
+    }
+
+    const saveResult = await storageSet("local", values);
+    if (!saveResult.ok) {
+      reportStorageNotice(`프롬프트 저장에 실패했습니다: ${saveResult.error}`);
+      return saveResult;
+    }
+    return { ok: true };
+  }
+
+  function saveSelectorState(options = {}) {
+    const nextSave = selectorSaveQueue
+      .catch(() => {})
+      .then(() => commitSelectorState(options));
+    selectorSaveQueue = nextSave;
+    return nextSave;
   }
 
   function ensureSlot(slotId) {
@@ -325,10 +643,10 @@
 
   function parseSlotId(slotId) {
     if (slotId === MAIN_BASE_SLOT_ID) {
-      return { scope: "main", kind: "base", label: "Base" };
+      return { scope: "main", kind: "base", label: "메인 프롬프트" };
     }
     if (slotId === MAIN_UC_SLOT_ID) {
-      return { scope: "main", kind: "uc", label: "Main UC" };
+      return { scope: "main", kind: "uc", label: "네거티브 프롬프트" };
     }
     const match = String(slotId || "").match(/^character\.(\d+)\.(prompt|uc)$/);
     if (match) {
@@ -338,7 +656,7 @@
         scope: "character",
         index,
         kind,
-        label: `Char ${index} ${kind === "prompt" ? "Prompt" : "UC"}`,
+        label: `캐릭터 ${index} ${kind === "prompt" ? "프롬프트" : "네거티브"}`,
       };
     }
     return null;
@@ -348,10 +666,15 @@
     return `character.${index}.${kind}`;
   }
 
+  function normalizeCharacterLabelValue(value) {
+    const label = String(value ?? "").slice(0, 48);
+    return label.trim() ? label : "";
+  }
+
   function getCharacterLabel(index) {
     const numericIndex = Number.parseInt(index, 10);
-    const label = selectorState.characterLabels?.[numericIndex];
-    return String(label || "").trim() || `Char ${numericIndex}`;
+    const label = getExplicitCharacterLabel(numericIndex);
+    return label || Core.getNextCharacterLabel(getCharacterLabelValues());
   }
 
   function setCharacterLabel(index, value) {
@@ -362,7 +685,7 @@
     if (!selectorState.characterLabels || typeof selectorState.characterLabels !== "object") {
       selectorState.characterLabels = {};
     }
-    const label = String(value || "").trim().slice(0, 48);
+    const label = normalizeCharacterLabelValue(value);
     if (label) {
       selectorState.characterLabels[numericIndex] = label;
     } else {
@@ -413,7 +736,7 @@
   function getExplicitCharacterLabel(index) {
     const numericIndex = Number.parseInt(index, 10);
     const label = selectorState.characterLabels?.[numericIndex];
-    return String(label || "").trim();
+    return normalizeCharacterLabelValue(label);
   }
 
   function copyExplicitCharacterLabel(index, label) {
@@ -421,7 +744,7 @@
       selectorState.characterLabels = {};
     }
     const numericIndex = Number.parseInt(index, 10);
-    const normalizedLabel = String(label || "").trim();
+    const normalizedLabel = normalizeCharacterLabelValue(label);
     if (normalizedLabel) {
       selectorState.characterLabels[numericIndex] = normalizedLabel;
     } else {
@@ -429,10 +752,65 @@
     }
   }
 
+  function getCharacterLabelValues() {
+    return Object.values(selectorState.characterLabels || {})
+      .map((label) => String(label || "").trim())
+      .filter(Boolean);
+  }
+
+  function materializeCharacterLabels(characters = []) {
+    if (!selectorState.characterLabels || typeof selectorState.characterLabels !== "object") {
+      selectorState.characterLabels = {};
+    }
+
+    const indices = [...new Set(
+      characters.map((character) => {
+        const index = typeof character === "object" ? character?.index : character;
+        const numericIndex = Number.parseInt(index, 10);
+        return Number.isFinite(numericIndex) && numericIndex > 0 ? numericIndex : null;
+      }).filter(Boolean),
+    )].sort((a, b) => a - b);
+    const firstKnownIndex = collectKnownCharacterIndices(characters)[0] || indices[0];
+
+    let changed = false;
+    for (const index of indices) {
+      if (getExplicitCharacterLabel(index)) {
+        continue;
+      }
+      selectorState.characterLabels[index] = index === firstKnownIndex
+        ? Core.DEFAULT_CHARACTER_LABEL
+        : Core.getNextCharacterLabel(getCharacterLabelValues());
+      changed = true;
+    }
+    return changed;
+  }
+
+  function ensureFirstCharacterPromptDefault(characters = []) {
+    const indices = [...new Set(
+      characters.map((character) => {
+        const numericIndex = Number.parseInt(character?.index, 10);
+        return Number.isFinite(numericIndex) && numericIndex > 0 ? numericIndex : null;
+      }).filter(Boolean),
+    )].sort((a, b) => a - b);
+    const firstIndex = indices[0];
+    if (!firstIndex) {
+      return false;
+    }
+
+    const slotId = makeCharacterSlotId(firstIndex, "prompt");
+    const slotData = ensureSlot(slotId);
+    if (hasSlotPromptData(slotData)) {
+      return false;
+    }
+
+    slotData.groupsDefinition = Core.DEFAULT_CHARACTER_PROMPT_GROUPS_DEFINITION;
+    return true;
+  }
+
   function getSlotLabel(slotId) {
     const parsed = parseSlotId(slotId);
     if (parsed?.scope === "character") {
-      return `${getCharacterLabel(parsed.index)} ${parsed.kind === "prompt" ? "Prompt" : "UC"}`;
+      return `${getCharacterLabel(parsed.index)} ${parsed.kind === "prompt" ? "프롬프트" : "네거티브"}`;
     }
     return parsed?.label || slotId;
   }
@@ -821,6 +1199,7 @@
       ensureSlot(makeCharacterSlotId(character.index, "prompt"));
       ensureSlot(makeCharacterSlotId(character.index, "uc"));
     }
+    scan.defaultedCharacterPrompt = ensureFirstCharacterPromptDefault(scan.characters);
 
     return scan;
   }
@@ -937,6 +1316,10 @@
 
   function syncSlotsWithDom({ pruneMissingCharacters = false, forcePruneMissingCharacters = false } = {}) {
     const scan = scanNovelAiPromptSlots();
+    let materializedCharacterLabels = false;
+    if (!pruneMissingCharacters && !forcePruneMissingCharacters) {
+      materializedCharacterLabels = materializeCharacterLabels(scan.characters);
+    }
     const reconciledCharacters = reconcileCharacterIndexState(scan.characters);
     const currentSlotIds = getCurrentDomSlotIds(scan);
     const shouldPruneMissingCharacters = (pruneMissingCharacters || reconciledCharacters)
@@ -958,9 +1341,11 @@
         const numericIndex = Number.parseInt(labelIndex, 10);
         if (!activeIndices.has(numericIndex)) {
           delete selectorState.characterLabels[labelIndex];
+          materializedCharacterLabels = true;
         }
       }
     }
+    materializedCharacterLabels = materializeCharacterLabels(scan.characters) || materializedCharacterLabels;
 
     if (!currentSlotIds.has(selectorState.activeSlotId)) {
       const activeSlot = parseSlotId(selectorState.activeSlotId);
@@ -969,11 +1354,16 @@
       }
     }
 
-    if (reconciledCharacters) {
+    if (reconciledCharacters || materializedCharacterLabels || scan.defaultedCharacterPrompt) {
       void saveSelectorState();
     }
 
-    return { scan, currentSlotIds, prunedMissingCharacters: shouldPruneMissingCharacters };
+    return {
+      scan,
+      currentSlotIds,
+      prunedMissingCharacters: shouldPruneMissingCharacters,
+      materializedCharacterLabels,
+    };
   }
 
   function getKnownSlotIds() {
@@ -1128,6 +1518,16 @@
     return character?.activeEditor || null;
   }
 
+  async function getEditorForParsedSlot(parsed) {
+    if (parsed?.scope === "main") {
+      return getMainEditorForKind(parsed.kind);
+    }
+    if (parsed?.scope === "character") {
+      return getCharacterEditorForKind(parsed.index, parsed.kind);
+    }
+    return null;
+  }
+
   async function applySlotToNovelAi(slotId, { skipEmpty = false, silent = false } = {}) {
     const parsed = parseSlotId(slotId);
     if (!parsed) {
@@ -1146,13 +1546,7 @@
       return { ok: false, error: message };
     }
 
-    let editor = null;
-    if (parsed.scope === "main") {
-      editor = await getMainEditorForKind(parsed.kind);
-    } else if (parsed.scope === "character") {
-      editor = await getCharacterEditorForKind(parsed.index, parsed.kind);
-    }
-
+    const editor = await getEditorForParsedSlot(parsed);
     if (!editor) {
       const message = `${getSlotLabel(slotId)}에 대응하는 NovelAI 입력 영역을 찾지 못했습니다.`;
       if (!silent) {
@@ -1162,6 +1556,16 @@
     }
 
     setEditablePlainText(editor, prompt);
+    const settled = await waitForEditableTextSettled(editor, prompt, {
+      resolveEditor: () => getEditorForParsedSlot(parsed),
+    });
+    if (!settled.ok) {
+      const message = `${getSlotLabel(slotId)} 슬롯 적용이 NovelAI 입력 영역에 안정적으로 반영되지 않았습니다.`;
+      if (!silent) {
+        setStatus(message, "warn");
+      }
+      return { ok: false, error: message, timeout: true };
+    }
     if (!silent) {
       setStatus(`${getSlotLabel(slotId)} 슬롯을 NovelAI에 적용했습니다.`, "ok");
     }
@@ -1169,50 +1573,67 @@
   }
 
   async function applyActiveSlotToNovelAi({ silent = false } = {}) {
-    ensurePanel();
-    return applySlotToNovelAi(getActiveSlotId(), { skipEmpty: false, silent });
+    return trackPromptApply(async () => {
+      ensurePanel();
+      const result = await applySlotToNovelAi(getActiveSlotId(), { skipEmpty: false, silent });
+      if (result.ok) {
+        await waitForPromptApplyFlush();
+      }
+      return result;
+    });
   }
 
   async function applyAllSlotsToNovelAi({ silent = false } = {}) {
-    ensurePanel();
-    const scan = scanNovelAiPromptSlots();
-    const slotIds = [
-      MAIN_BASE_SLOT_ID,
-      MAIN_UC_SLOT_ID,
-      ...scan.characters.flatMap((character) => [
-        makeCharacterSlotId(character.index, "prompt"),
-        makeCharacterSlotId(character.index, "uc"),
-      ]),
-    ];
+    return trackPromptApply(async () => {
+      ensurePanel();
+      const scan = scanNovelAiPromptSlots();
+      const slotIds = [
+        MAIN_BASE_SLOT_ID,
+        MAIN_UC_SLOT_ID,
+        ...scan.characters.flatMap((character) => [
+          makeCharacterSlotId(character.index, "prompt"),
+          makeCharacterSlotId(character.index, "uc"),
+        ]),
+      ];
 
-    let appliedCount = 0;
-    const errors = [];
-    for (const slotId of slotIds) {
-      const result = await applySlotToNovelAi(slotId, { skipEmpty: true, silent: true });
-      if (result.ok && !result.skipped) {
-        appliedCount += 1;
-      } else if (!result.ok && !result.missing) {
-        errors.push(result.error);
+      let appliedCount = 0;
+      const errors = [];
+      for (const slotId of slotIds) {
+        const result = await applySlotToNovelAi(slotId, { skipEmpty: true, silent: true });
+        if (result.ok && !result.skipped) {
+          appliedCount += 1;
+        } else if (!result.ok && !result.missing) {
+          errors.push(result.error);
+        }
       }
-    }
 
-    if (appliedCount > 0) {
-      setStatus(`총 ${appliedCount}개 슬롯을 NovelAI에 적용했습니다.`, "ok");
-      return { ok: true, appliedCount };
-    }
+      if (errors.length > 0) {
+        const message = errors[0];
+        if (!silent) {
+          setStatus(message, "warn");
+        }
+        return { ok: false, error: message, appliedCount };
+      }
 
-    const message = errors[0] || "적용할 슬롯 프롬프트가 없습니다.";
-    if (!silent) {
-    setStatus(message, "warn");
-    }
-    return { ok: false, error: message, appliedCount };
+      if (appliedCount > 0) {
+        await waitForPromptApplyFlush();
+        setStatus(`총 ${appliedCount}개 슬롯을 NovelAI에 적용했습니다.`, "ok");
+        return { ok: true, appliedCount };
+      }
+
+      const message = "적용할 슬롯 프롬프트가 없습니다.";
+      if (!silent) {
+        setStatus(message, "warn");
+      }
+      return { ok: false, error: message, appliedCount };
+    });
   }
 
   async function addNovelAiCharacter(kind = "Female") {
     ensurePanel();
     const addButton = findAddCharacterButton();
     if (!addButton) {
-      const message = "Add Character 버튼을 찾지 못했습니다.";
+      const message = "캐릭터 추가 버튼을 찾지 못했습니다.";
       setStatus(message, "warn");
       return { ok: false, error: message };
     }
@@ -1236,11 +1657,12 @@
 
     syncSlotsWithDom({ pruneMissingCharacters: true });
     if (newIndex) {
+      materializeCharacterLabels([{ index: newIndex }]);
       setSelectedCharacterIndex(newIndex, { selectPromptSlot: true });
       selectorState.activePanelTab = getCharacterPanelTabId(newIndex);
       pendingDeleteCharacterIndex = null;
     }
-    await saveSelectorState();
+    await saveSelectorState({ reason: "add-character", explicit: true });
     updateEditorFieldsFromActiveSlot();
     renderSlotButtons();
     renderPromptSelector();
@@ -1251,6 +1673,7 @@
   async function moveNovelAiCharacter(direction) {
     ensurePanel();
     const scan = scanNovelAiPromptSlots();
+    materializeCharacterLabels(scan.characters);
     const indices = getCurrentCharacterIndices(scan);
     const selectedIndex = getSelectedCharacterIndex(scan);
     if (!selectedIndex || !indices.includes(selectedIndex)) {
@@ -1286,7 +1709,7 @@
     selectorState.activePanelTab = getCharacterPanelTabId(nextIndex);
     await delay(350);
     syncSlotsWithDom();
-    await saveSelectorState();
+    await saveSelectorState({ reason: "move-character", explicit: true });
     updateEditorFieldsFromActiveSlot();
     renderSlotButtons();
     renderPromptSelector();
@@ -1339,6 +1762,7 @@
   async function deleteNovelAiCharacter() {
     ensurePanel();
     const scan = scanNovelAiPromptSlots();
+    materializeCharacterLabels(scan.characters);
     const indices = getCurrentCharacterIndices(scan);
     const selectedIndex = getActiveCharacterIndexFromPanelTab() || getSelectedCharacterIndex(scan);
     if (!selectedIndex || !indices.includes(selectedIndex)) {
@@ -1374,7 +1798,7 @@
       selectorState.activePanelTab = "main";
     }
     pendingDeleteCharacterIndex = null;
-    await saveSelectorState();
+    await saveSelectorState({ reason: "delete-character", explicit: true, forceBackup: true });
     updateEditorFieldsFromActiveSlot();
     renderSlotButtons();
     renderPromptSelector();
@@ -1432,7 +1856,7 @@
   function refreshAfterExternalCharacterAction(message) {
     suppressCharacterReconcile();
     syncSlotsWithDom({ pruneMissingCharacters: true, forcePruneMissingCharacters: true });
-    void saveSelectorState();
+    void saveSelectorState({ reason: "external-character-prune", explicit: true, forceBackup: true });
     updateEditorFieldsFromActiveSlot();
     renderSlotButtons();
     renderPromptSelector();
@@ -1494,7 +1918,9 @@
     if (!action) {
       return;
     }
-    const indices = getCurrentCharacterIndices();
+    const scan = scanNovelAiPromptSlots();
+    materializeCharacterLabels(scan.characters);
+    const indices = getCurrentCharacterIndices(scan);
     const previousMaxIndex = Math.max(...indices, 0);
     const previousCount = indices.length;
     if (action === "delete") {
@@ -2015,27 +2441,53 @@
     setStatus(`자동 생성 완료: ${count}장`, "ok");
   }
 
-  function waitForHistoryThenShowCompletion(count) {
+  function cancelAutoHistoryHighlightWait() {
+    autoHistoryHighlightWait.token += 1;
+    if (autoHistoryHighlightWait.intervalId) {
+      clearInterval(autoHistoryHighlightWait.intervalId);
+      autoHistoryHighlightWait.intervalId = null;
+    }
+  }
+
+  function waitForAutoHistoryThenRun(count, initialHistoryCount, callback) {
     const safeCount = Math.max(0, Number.parseInt(count, 10) || 0);
+    cancelAutoHistoryHighlightWait();
+    const token = autoHistoryHighlightWait.token;
     if (!safeCount) {
-      clearAllHighlights();
-      showAutoCompletionFeedback(0);
+      callback(0);
       return;
     }
 
     let attempts = 0;
-    const initialHistoryCount = autoRun.initialHistoryCount;
+    const safeInitialHistoryCount = Math.max(0, Number.parseInt(initialHistoryCount, 10) || 0);
     const checkInterval = setInterval(() => {
+      if (token !== autoHistoryHighlightWait.token) {
+        clearInterval(checkInterval);
+        return;
+      }
       attempts += 1;
       const historyContainer = document.getElementById("historyContainer");
       const currentCount = historyContainer
         ? historyContainer.querySelectorAll(HISTORY_ITEM_SELECTOR).length
         : 0;
-      if (currentCount >= initialHistoryCount + safeCount || attempts > 50) {
+      if (currentCount >= safeInitialHistoryCount + safeCount || attempts > 50) {
         clearInterval(checkInterval);
-        showAutoCompletionFeedback(safeCount);
+        if (autoHistoryHighlightWait.intervalId === checkInterval) {
+          autoHistoryHighlightWait.intervalId = null;
+        }
+        callback(safeCount);
       }
     }, 200);
+    autoHistoryHighlightWait.intervalId = checkInterval;
+  }
+
+  function waitForHistoryThenShowCompletion(count, initialHistoryCount = autoRun.initialHistoryCount) {
+    waitForAutoHistoryThenRun(count, initialHistoryCount, (readyCount) => {
+      if (!readyCount) {
+        clearAllHighlights();
+      }
+      showAutoCompletionFeedback(readyCount);
+    });
   }
 
   function showCompletionOverlay(count) {
@@ -2124,7 +2576,23 @@
     });
   }
 
-  async function clickGenerate({ useSelector = false, silent = false } = {}) {
+  function isGenerationCancelled(shouldContinue) {
+    return typeof shouldContinue === "function" && !shouldContinue();
+  }
+
+  function getGenerationCancelledResult() {
+    return { ok: false, cancelled: true, error: "생성이 취소되었습니다." };
+  }
+
+  async function clickGenerate({ useSelector = false, silent = false, shouldContinue = null } = {}) {
+    const pendingApply = await waitForPendingPromptApply({ silent });
+    if (!pendingApply.ok) {
+      return pendingApply;
+    }
+    if (isGenerationCancelled(shouldContinue)) {
+      return getGenerationCancelledResult();
+    }
+
     if (!runSafetyChecks({ alertUser: !silent })) {
       return { ok: false, error: "Safety check failed." };
     }
@@ -2134,12 +2602,20 @@
       if (!applied.ok) {
         return applied;
       }
-      await delay(120);
+      await waitForPromptApplyFlush();
+    } else {
+      const promptReady = await waitForPendingPromptApply({ silent });
+      if (!promptReady.ok) {
+        return promptReady;
+      }
+    }
+    if (isGenerationCancelled(shouldContinue)) {
+      return getGenerationCancelledResult();
     }
 
     const button = findGenerateButton();
     if (!button) {
-      const message = "Generate 버튼을 찾지 못했습니다.";
+      const message = "생성 버튼을 찾지 못했습니다.";
       setStatus(message, "warn");
       if (!silent) {
         alert(message);
@@ -2147,7 +2623,7 @@
       return { ok: false, error: message };
     }
     if (button.disabled) {
-      const message = "Generate 버튼이 아직 비활성화 상태입니다.";
+      const message = "생성 버튼이 아직 비활성화 상태입니다.";
       setStatus(message, "warn");
       return { ok: false, error: message };
     }
@@ -2199,27 +2675,66 @@
     }
   }
 
-  async function stopAutoGenerate({ playAudio = false } = {}) {
+  function createStoppedAutoHighlightSnapshot() {
+    const count = Math.max(0, Number.parseInt(autoRun.count, 10) || 0);
+    const completedCount = Math.max(0, Number.parseInt(autoRun.completedCount, 10) || 0);
+    return {
+      count: autoRun.waitingForCompletion ? count : completedCount,
+      initialHistoryCount: Math.max(0, Number.parseInt(autoRun.initialHistoryCount, 10) || 0),
+    };
+  }
+
+  function highlightStoppedAutoHistory(snapshot) {
+    const count = Math.max(0, Number.parseInt(snapshot?.count, 10) || 0);
+    if (!count) {
+      return false;
+    }
+
+    waitForAutoHistoryThenRun(count, snapshot.initialHistoryCount, (readyCount) => {
+      highlightRecentHistory(readyCount);
+      setStatus(`자동 생성을 중지했습니다. 생성된 ${readyCount}장을 히스토리에서 강조했습니다.`, "ok");
+    });
+    return true;
+  }
+
+  async function stopAutoGenerate({ playAudio = false, highlightGenerated = true } = {}) {
     const wasActive = autoRun.active;
+    const stoppedHighlightSnapshot = highlightGenerated && wasActive
+      ? createStoppedAutoHighlightSnapshot()
+      : null;
+    if (wasActive || !highlightGenerated) {
+      cancelAutoHistoryHighlightWait();
+    }
     clearAutoTimers();
+    autoRun.token += 1;
     autoRun.active = false;
     autoRun.waitingForCompletion = false;
+    autoRun.waitingForExistingGeneration = false;
     await storageSet("sync", { autoClickEnabled: false });
     renderAutoRunControls();
     if (playAudio && wasActive) {
       await playSound("stop.mp3");
     }
     setStatus(wasActive ? "자동 생성을 중지했습니다." : "자동 생성이 실행 중이 아닙니다.", wasActive ? "ok" : "warn");
+    if (stoppedHighlightSnapshot) {
+      highlightStoppedAutoHistory(stoppedHighlightSnapshot);
+    }
     return { ok: true };
   }
 
   async function clickForAutoRun() {
-    const result = await clickGenerate({ useSelector: autoRun.useSelector, silent: true });
+    const token = autoRun.token;
+    const result = await clickGenerate({
+      useSelector: autoRun.useSelector,
+      silent: true,
+      shouldContinue: () => autoRun.active && token === autoRun.token,
+    });
     if (!result.ok) {
       return result;
     }
     autoRun.count += 1;
     autoRun.waitingForCompletion = true;
+    autoRun.waitingForExistingGeneration = false;
     autoRun.ignoreReadyUntil = Date.now() + 900;
     renderAutoRunControls();
     setStatus(`자동 생성 진행 중: ${autoRun.count}${autoRun.target ? ` / ${autoRun.target}` : ""}`, "ok");
@@ -2228,22 +2743,63 @@
 
   async function completeAutoRun() {
     const count = autoRun.completedCount || autoRun.count;
+    const initialHistoryCount = autoRun.initialHistoryCount;
     clearAutoTimers();
     autoRun.active = false;
     autoRun.waitingForCompletion = false;
+    autoRun.waitingForExistingGeneration = false;
     await storageSet("sync", { autoClickEnabled: false });
     renderAutoRunControls();
 
-    waitForHistoryThenShowCompletion(count);
+    waitForHistoryThenShowCompletion(count, initialHistoryCount);
+  }
+
+  async function scheduleNextAutoClick({ afterExistingGeneration = false } = {}) {
+    const token = autoRun.token;
+    const { intervalTime = 3 } = await storageGet("sync", ["intervalTime"]);
+    const intervalSeconds = Math.max(0.1, Number.parseFloat(intervalTime) || 3);
+    if (!autoRun.active || token !== autoRun.token) {
+      return;
+    }
+    if (autoRun.timeoutId) {
+      clearTimeout(autoRun.timeoutId);
+      autoRun.timeoutId = null;
+    }
+    if (afterExistingGeneration) {
+      setStatus(`현재 생성 완료: ${intervalSeconds}초 후 자동 생성을 시작합니다.`, "ok");
+    }
+    autoRun.timeoutId = setTimeout(async () => {
+      autoRun.timeoutId = null;
+      if (!autoRun.active || token !== autoRun.token) {
+        return;
+      }
+      if (!runSafetyChecks({ alertUser: true })) {
+        await stopAutoGenerate({ playAudio: true });
+        chrome.runtime.sendMessage({ action: "resetPopupButtons" });
+        return;
+      }
+      const result = await clickForAutoRun();
+      if (!result.ok && !result.cancelled) {
+        await stopAutoGenerate({ playAudio: true });
+      }
+    }, intervalSeconds * 1000);
   }
 
   async function handleAutoProgress() {
-    if (!autoRun.active || !autoRun.waitingForCompletion || Date.now() < autoRun.ignoreReadyUntil) {
+    const waitsForReadyButton = autoRun.waitingForCompletion || autoRun.waitingForExistingGeneration;
+    if (!autoRun.active || !waitsForReadyButton || Date.now() < autoRun.ignoreReadyUntil) {
       return;
     }
 
     const button = findGenerateButton();
     if (!button || button.disabled) {
+      return;
+    }
+
+    if (autoRun.waitingForExistingGeneration) {
+      autoRun.waitingForExistingGeneration = false;
+      renderAutoRunControls();
+      await scheduleNextAutoClick({ afterExistingGeneration: true });
       return;
     }
 
@@ -2257,34 +2813,23 @@
       return;
     }
 
-    const { intervalTime = 3 } = await storageGet("sync", ["intervalTime"]);
-    const intervalSeconds = Math.max(0.1, Number.parseFloat(intervalTime) || 3);
-    autoRun.timeoutId = setTimeout(async () => {
-      if (!autoRun.active) {
-        return;
-      }
-      if (!runSafetyChecks({ alertUser: true })) {
-        await stopAutoGenerate({ playAudio: true });
-        chrome.runtime.sendMessage({ action: "resetPopupButtons" });
-        return;
-      }
-      const result = await clickForAutoRun();
-      if (!result.ok) {
-        await stopAutoGenerate({ playAudio: true });
-      }
-    }, intervalSeconds * 1000);
+    await scheduleNextAutoClick();
   }
 
   async function startAutoGenerate({ useSelector = false } = {}) {
+    const pendingApply = await waitForPendingPromptApply();
+    if (!pendingApply.ok) {
+      return pendingApply;
+    }
+
     if (!runSafetyChecks({ alertUser: true })) {
       return { ok: false, error: "Safety check failed." };
     }
 
-    await stopAutoGenerate({ playAudio: false });
-    const { gcount = "" } = await storageGet("sync", ["gcount"]);
-    if (ui.countInput) {
-      ui.countInput.value = gcount;
-    }
+    await stopAutoGenerate({ playAudio: false, highlightGenerated: false });
+    autoRun.token += 1;
+    const { gcount = "", intervalTime = ui.intervalInput?.value ?? 3 } = await storageGet("sync", ["gcount", "intervalTime"]);
+    setAutoTimingInputs({ intervalTime, gcount });
     autoRun.active = true;
     autoRun.count = 0;
     autoRun.completedCount = 0;
@@ -2292,6 +2837,7 @@
     autoRun.initialHistoryCount = findHistoryItems().length;
     autoRun.useSelector = Boolean(useSelector);
     autoRun.waitingForCompletion = false;
+    autoRun.waitingForExistingGeneration = false;
     autoRun.ignoreReadyUntil = 0;
     renderAutoRunControls();
     setPanelCollapsed(true);
@@ -2300,15 +2846,27 @@
     await playSound("start.mp3");
     chrome.runtime.sendMessage({ action: "closePopup" });
 
-    const result = await clickForAutoRun();
-    if (!result.ok) {
-      await stopAutoGenerate({ playAudio: true });
-      return result;
-    }
-
     autoRun.timerId = setInterval(() => {
       void handleAutoProgress();
     }, AUTO_REFRESH_MS);
+
+    const generateButton = findGenerateButton();
+    if (generateButton?.disabled) {
+      autoRun.waitingForExistingGeneration = true;
+      autoRun.ignoreReadyUntil = Date.now() + 900;
+      renderAutoRunControls();
+      setStatus("현재 생성 완료를 기다린 뒤 자동 생성을 시작합니다.", "ok");
+      return { ok: true, delayed: true };
+    }
+
+    const result = await clickForAutoRun();
+    if (!result.ok) {
+      if (!result.cancelled) {
+        await stopAutoGenerate({ playAudio: true });
+      }
+      return result;
+    }
+
     return { ok: true };
   }
 
@@ -2339,12 +2897,27 @@
       ui.collapsedCount.textContent = `${completedCount} / ${formatAutoTarget(target)}`;
     }
     if (ui.collapsedAutoButton) {
-      ui.collapsedAutoButton.textContent = autoRun.active ? "중지" : "시작";
+      const label = ui.collapsedAutoButton.querySelector(".nps-btn-label");
+      const icon = ui.collapsedAutoButton.querySelector(".nps-icon");
+      if (icon) {
+        icon.classList.toggle("nps-icon-play", !autoRun.active);
+        icon.classList.toggle("nps-icon-stop", autoRun.active);
+      }
+      if (label) {
+        label.textContent = autoRun.active ? "중지" : "시작";
+      } else {
+        ui.collapsedAutoButton.textContent = autoRun.active ? "중지" : "시작";
+      }
       ui.collapsedAutoButton.dataset.active = autoRun.active ? "true" : "false";
       ui.collapsedAutoButton.title = autoRun.active ? "자동 생성 중지" : "자동 생성 시작";
     }
     if (ui.autoButton) {
-      ui.autoButton.textContent = autoRun.active ? "자동 생성 중지" : "자동 생성";
+      const label = ui.autoButton.querySelector(".nps-btn-label");
+      if (label) {
+        label.textContent = autoRun.active ? "자동 중지" : "자동";
+      } else {
+        ui.autoButton.textContent = autoRun.active ? "자동 중지" : "자동";
+      }
       ui.autoButton.dataset.active = autoRun.active ? "true" : "false";
     }
   }
@@ -2354,14 +2927,14 @@
       return;
     }
     const prompt = buildCurrentPrompt();
-    ui.preview.textContent = prompt || "No prompt selected.";
+    ui.preview.textContent = prompt || "선택된 프롬프트가 없습니다.";
     ui.preview.classList.toggle("is-empty", !prompt);
     if (ui.copyButton) {
       ui.copyButton.disabled = !prompt;
     }
     if (ui.promptMeta) {
       const lines = prompt ? prompt.split(/\r?\n/).length : 0;
-      ui.promptMeta.textContent = prompt ? `${prompt.length} chars / ${lines} lines` : "empty";
+      ui.promptMeta.textContent = prompt ? `${prompt.length}자 / ${lines}줄` : "비어 있음";
     }
   }
 
@@ -2520,7 +3093,7 @@
     if (isSuffix && !isBaseSlot) {
       groupList.replaceChildren();
       if (summary) {
-        summary.textContent = "Base only";
+        summary.textContent = "메인 프롬프트 전용";
       }
       return;
     }
@@ -2528,13 +3101,13 @@
     const { groups, selectionState } = parseSlotSelectorState(getActiveSlotId(), mode);
     groupList.replaceChildren();
     if (summary) {
-      summary.textContent = `${groups.length} group(s)`;
+      summary.textContent = `${groups.length}개 그룹`;
     }
 
     if (!groups.length) {
       const empty = document.createElement("div");
       empty.className = "nps-empty";
-      empty.textContent = "Group format example:\n\n[Quality]\nnewest\nbest quality\n\n[Character]\n1girl";
+        empty.textContent = "그룹 형식 예시:\n\n[Quality]\nnewest\nbest quality\n\n[Character]\n1girl";
       groupList.append(empty);
       return;
     }
@@ -2555,7 +3128,7 @@
       title.textContent = group.name;
       const meta = document.createElement("div");
       meta.className = "nps-group-meta";
-      meta.textContent = `${selectedCount} selected / ${group.items.length}`;
+      meta.textContent = `${selectedCount}개 선택 / ${group.items.length}개`;
       titleWrap.append(title, meta);
 
       const actions = document.createElement("div");
@@ -2681,31 +3254,110 @@
     }
   }
 
-  async function loadAutoSettingsIntoPanel() {
-    if (!ui.intervalInput || !ui.countInput) {
-      return;
+  function normalizeAutoInterval(value) {
+    return Math.max(0.1, Number.parseFloat(value) || 3);
+  }
+
+  function normalizeAutoCount(value) {
+    const rawCount = Number.parseInt(value, 10);
+    return Number.isFinite(rawCount) && rawCount > 0 ? rawCount : "";
+  }
+
+  function normalizeAutoVolume(value) {
+    const rawVolume = Number(value);
+    return Number.isFinite(rawVolume) ? Math.max(0, Math.min(1, rawVolume)) : 0.5;
+  }
+
+  function setAutoTimingInputs({ intervalTime = 3, gcount = "" } = {}) {
+    const intervalSeconds = normalizeAutoInterval(intervalTime);
+    const count = normalizeAutoCount(gcount);
+    const intervalText = String(intervalSeconds);
+    const countText = String(count);
+    for (const input of [ui.intervalInput, ui.collapsedIntervalInput]) {
+      if (input) {
+        input.value = intervalText;
+      }
     }
-    const { intervalTime = 3, gcount = "" } = await storageGet("sync", ["intervalTime", "gcount"]);
-    ui.intervalInput.value = intervalTime;
-    ui.countInput.value = gcount;
+    for (const input of [ui.countInput, ui.collapsedCountInput]) {
+      if (input) {
+        input.value = countText;
+      }
+    }
+  }
+
+  function setAutoPreferenceInputs(settings = {}) {
+    if (Object.prototype.hasOwnProperty.call(settings, "autoSaveEnabled") && ui.autoSaveToggle) {
+      const { autoSaveEnabled = false } = settings;
+      ui.autoSaveToggle.checked = Boolean(autoSaveEnabled);
+    }
+    if (
+      Object.prototype.hasOwnProperty.call(settings, "autoCompletionNotificationEnabled")
+      && ui.autoNotificationToggle
+    ) {
+      const { autoCompletionNotificationEnabled = true } = settings;
+      ui.autoNotificationToggle.checked = autoCompletionNotificationEnabled !== false;
+    }
+    if (Object.prototype.hasOwnProperty.call(settings, "volume")) {
+      const volumePercent = Math.round(normalizeAutoVolume(settings.volume) * 100);
+      if (ui.autoVolumeSlider) {
+        ui.autoVolumeSlider.value = String(volumePercent);
+      }
+      if (ui.autoVolumeValue) {
+        ui.autoVolumeValue.textContent = `${volumePercent}%`;
+      }
+    }
+  }
+
+  function setAutoSettingsInputs(settings = {}, { updateTiming = true } = {}) {
+    if (updateTiming) {
+      setAutoTimingInputs(settings);
+    }
+    setAutoPreferenceInputs(settings);
     renderAutoRunControls();
   }
 
-  function saveAutoSettingsFromPanel() {
-    const intervalSeconds = Math.max(0.1, Number.parseFloat(ui.intervalInput?.value) || 3);
-    const rawCount = Number.parseInt(ui.countInput?.value, 10);
-    const count = Number.isFinite(rawCount) && rawCount > 0 ? rawCount : "";
-    if (ui.intervalInput) {
-      ui.intervalInput.value = String(intervalSeconds);
-    }
-    if (ui.countInput) {
-      ui.countInput.value = count;
-    }
-    renderAutoRunControls();
-    return storageSet("sync", {
-      intervalTime: intervalSeconds,
-      gcount: count,
+  function readAutoTimingInputs(source = "expanded") {
+    const countInput = source === "collapsed" ? ui.collapsedCountInput : ui.countInput;
+    const intervalInput = source === "collapsed" ? ui.collapsedIntervalInput : ui.intervalInput;
+    return {
+      intervalTime: normalizeAutoInterval(intervalInput?.value),
+      gcount: normalizeAutoCount(countInput?.value),
+    };
+  }
+
+  async function loadAutoSettingsIntoPanel() {
+    const {
+      intervalTime = 3,
+      gcount = "",
+      autoSaveEnabled = false,
+      volume = 0.5,
+      autoCompletionNotificationEnabled = true,
+    } = await storageGet("sync", AUTO_SETTINGS_KEYS);
+    setAutoSettingsInputs({
+      intervalTime,
+      gcount,
+      autoSaveEnabled,
+      volume,
+      autoCompletionNotificationEnabled,
     });
+  }
+
+  function saveAutoSettingsFromPanel({ source = "expanded" } = {}) {
+    const settings = readAutoTimingInputs(source);
+    setAutoTimingInputs(settings);
+    renderAutoRunControls();
+    return storageSet("sync", settings);
+  }
+
+  function saveAutoPreferencesFromPanel() {
+    const volume = normalizeAutoVolume(Number(ui.autoVolumeSlider?.value) / 100);
+    const settings = {
+      autoSaveEnabled: Boolean(ui.autoSaveToggle?.checked),
+      volume,
+      autoCompletionNotificationEnabled: ui.autoNotificationToggle?.checked !== false,
+    };
+    setAutoPreferenceInputs(settings);
+    return storageSet("sync", settings);
   }
 
   function getActiveCharacterIndexFromPanelTab() {
@@ -2795,15 +3447,19 @@
     const activeSlot = parseSlotId(getActiveSlotId());
     const modes = panelTab?.kind === "character"
       ? [
-          { kind: "prompt", label: "Prompt" },
-          { kind: "uc", label: "UC" },
+          { kind: "prompt", label: "프롬프트" },
+          { kind: "uc", label: "네거티브" },
         ]
       : [
-          { kind: "base", label: "Base Prompt" },
-          { kind: "uc", label: "Main UC" },
+          { kind: "base", label: "메인 프롬프트" },
+          { kind: "uc", label: "네거티브" },
         ];
 
     ui.slotModeTabs.replaceChildren();
+    ui.slotModeTabs.hidden = panelTab?.kind !== "character";
+    if (ui.slotModeTabs.hidden) {
+      return;
+    }
     for (const mode of modes) {
       const button = document.createElement("button");
       button.type = "button";
@@ -2813,6 +3469,41 @@
       button.addEventListener("click", () => setActiveSlotKind(mode.kind));
       ui.slotModeTabs.append(button);
     }
+  }
+
+  function getPromptChipTitle(slotId = getActiveSlotId()) {
+    const parsed = parseSlotId(slotId);
+    if (slotId === MAIN_BASE_SLOT_ID) {
+      return "선행 칩";
+    }
+    return parsed?.kind === "uc" ? "네거티브 칩" : "프롬프트 칩";
+  }
+
+  function renderEditorPromptCopy() {
+    const slotId = getActiveSlotId();
+    const parsed = parseSlotId(slotId);
+    const isCharacterSlot = parsed?.scope === "character";
+    const isBaseSlot = slotId === MAIN_BASE_SLOT_ID;
+
+    if (ui.leadingTitle) {
+      ui.leadingTitle.textContent = getPromptChipTitle(slotId);
+    }
+    if (ui.quickMeta) {
+      ui.quickMeta.hidden = isCharacterSlot;
+      ui.quickMeta.textContent = isCharacterSlot
+        ? ""
+        : isBaseSlot
+          ? "선행 칩과 후행 칩 사이에 병합됩니다"
+          : "직접 입력한 프롬프트를 함께 병합합니다";
+    }
+  }
+
+  function getPromptSelectionClearLabel(slotId = getActiveSlotId()) {
+    if (slotId === MAIN_BASE_SLOT_ID) {
+      return "선행 프롬프트 선택";
+    }
+    const parsed = parseSlotId(slotId);
+    return parsed?.kind === "uc" ? "네거티브 프롬프트 선택" : "프롬프트 선택";
   }
 
   function renderActivePanelView() {
@@ -2826,10 +3517,11 @@
     }
     if (ui.slotModeTitle) {
       ui.slotModeTitle.textContent = panelTab?.kind === "character"
-        ? `${getCharacterLabel(panelTab.index)} 편집`
-        : "Base / Main UC";
+        ? `${getSlotLabel(getActiveSlotId())} 편집`
+        : `${getSlotLabel(getActiveSlotId())} 편집`;
     }
     renderSlotModeTabs();
+    renderEditorPromptCopy();
   }
 
   function renderCharacterControls() {
@@ -2840,7 +3532,7 @@
     const character = scan.characters.find((entry) => entry.index === panelCharacterIndex) || null;
     const isEnabled = character?.enabled !== false;
     if (ui.activeCharacterLabel) {
-      ui.activeCharacterLabel.textContent = selectedPosition >= 0 ? getCharacterLabel(panelCharacterIndex) : "none";
+      ui.activeCharacterLabel.textContent = selectedPosition >= 0 ? getCharacterLabel(panelCharacterIndex) : "없음";
     }
     const isCharacterTab = selectedPosition >= 0;
     if (ui.characterEditorTools) {
@@ -2852,9 +3544,13 @@
     }
     if (ui.characterNameInput && isCharacterTab) {
       const nextLabel = getCharacterLabel(panelCharacterIndex);
-      if (ui.characterNameInput.value !== nextLabel) {
+      const isEditingCurrentName = editingCharacterNameIndex === panelCharacterIndex
+        && panelShadow?.activeElement === ui.characterNameInput;
+      if (!isEditingCurrentName && ui.characterNameInput.value !== nextLabel) {
         ui.characterNameInput.value = nextLabel;
       }
+    } else if (!isCharacterTab) {
+      editingCharacterNameIndex = null;
     }
     if (ui.characterEnabledButton) {
       ui.characterEnabledButton.hidden = !isCharacterTab;
@@ -2945,7 +3641,18 @@
       ui.sidebarAutoTab.classList.toggle("is-active", selectorState.activePanelTab === "auto");
     }
     if (ui.sidebarMainTab) {
-      ui.sidebarMainTab.classList.toggle("is-active", selectorState.activePanelTab === "main");
+      const activeSlot = parseSlotId(getActiveSlotId());
+      ui.sidebarMainTab.classList.toggle(
+        "is-active",
+        selectorState.activePanelTab === "main" && activeSlot?.kind !== "uc",
+      );
+    }
+    if (ui.sidebarNegativeTab) {
+      const activeSlot = parseSlotId(getActiveSlotId());
+      ui.sidebarNegativeTab.classList.toggle(
+        "is-active",
+        selectorState.activePanelTab === "main" && activeSlot?.kind === "uc",
+      );
     }
 
     if (ui.characterTabList) {
@@ -2953,7 +3660,7 @@
       if (!indices.length) {
         const empty = document.createElement("div");
         empty.className = "nps-sidebar-empty";
-        empty.textContent = "No character";
+        empty.textContent = "캐릭터 없음";
         ui.characterTabList.append(empty);
       }
 
@@ -3042,7 +3749,7 @@
     selectorState.activePanelTab = getCharacterPanelTabId(targetIndex);
     setSelectedCharacterIndex(targetIndex, { selectPromptSlot: true });
     pendingDeleteCharacterIndex = null;
-    await saveSelectorState();
+    await saveSelectorState({ reason: "drag-reorder-character", explicit: true });
     updateEditorFieldsFromActiveSlot();
     renderSlotButtons();
     renderPromptSelector();
@@ -3052,15 +3759,19 @@
 
   function refreshSlotsFromDom({ pruneMissingCharacters = false, forcePruneMissingCharacters = false } = {}) {
     syncSlotsWithDom({ pruneMissingCharacters, forcePruneMissingCharacters });
-    void saveSelectorState();
+    void saveSelectorState({
+      reason: pruneMissingCharacters || forcePruneMissingCharacters ? "refresh-slots-prune" : "refresh-slots",
+      explicit: pruneMissingCharacters || forcePruneMissingCharacters,
+      forceBackup: pruneMissingCharacters || forcePruneMissingCharacters,
+    });
     updateEditorFieldsFromActiveSlot();
     renderSlotButtons();
     renderPromptSelector();
   }
 
   function getPanelFallbackSize(collapsed = selectorState.panelCollapsed) {
-    const fallbackWidth = collapsed ? 224 : 720;
-    const fallbackHeight = collapsed ? 64 : Math.min(680, Math.max(64, window.innerHeight - 24));
+    const fallbackWidth = collapsed ? 116 : 720;
+    const fallbackHeight = collapsed ? 185 : Math.min(680, Math.max(64, window.innerHeight - 24));
     return { width: fallbackWidth, height: fallbackHeight };
   }
 
@@ -3530,10 +4241,110 @@
     });
   }
 
+  function refreshPanelFromSelectorState() {
+    updateEditorFieldsFromActiveSlot();
+    renderSlotButtons();
+    renderPromptSelector();
+  }
+
+  function getTimestampForFilename(date = new Date()) {
+    return [
+      date.getFullYear(),
+      String(date.getMonth() + 1).padStart(2, "0"),
+      String(date.getDate()).padStart(2, "0"),
+      String(date.getHours()).padStart(2, "0"),
+      String(date.getMinutes()).padStart(2, "0"),
+      String(date.getSeconds()).padStart(2, "0"),
+    ].join("");
+  }
+
+  function downloadTextFile(filename, text, mimeType = "application/json") {
+    const blob = new Blob([text], { type: `${mimeType};charset=utf-8` });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = filename;
+    link.rel = "noopener";
+    document.documentElement.append(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
+
+  function exportSelectorState() {
+    const envelope = Store.createExportEnvelope(selectorState, {
+      extensionId: chrome.runtime.id,
+    });
+    const filename = `nai-prompt-selector-backup-${getTimestampForFilename()}.json`;
+    downloadTextFile(filename, `${JSON.stringify(envelope, null, 2)}\n`);
+    setStatus("프롬프트 백업 JSON을 내보냈습니다.", "ok");
+  }
+
+  async function importSelectorFromText(text) {
+    const parsed = Store.parseExportEnvelope(text);
+    if (!parsed.ok) {
+      setStatus(parsed.error, "warn");
+      return { ok: false, error: parsed.error };
+    }
+
+    const nextState = migrateStoredSelectorState(parsed.envelope.selector);
+    await saveSelectorState({ reason: "before-import", explicit: true, forceBackup: true });
+    selectorState = nextState;
+    await saveSelectorState({ reason: "import-json", explicit: true, skipBackup: true });
+    refreshPanelFromSelectorState();
+    setStatus("프롬프트 백업 JSON을 가져왔습니다.", "ok");
+    return { ok: true };
+  }
+
+  async function importSelectorFromFile(file) {
+    if (!file) {
+      return;
+    }
+    try {
+      await importSelectorFromText(await file.text());
+    } catch (error) {
+      setStatus("프롬프트 백업 JSON을 가져오지 못했습니다.", "warn");
+    }
+  }
+
+  async function restoreLatestSelectorBackup() {
+    const result = await storageGet("local", [
+      SELECTOR_BACKUPS_STORAGE_KEY,
+      SELECTOR_LAST_GOOD_STORAGE_KEY,
+    ]);
+    const meaningfulOptions = getSelectorMeaningfulOptions();
+    const backup = Store.getLatestRestorableBackup(result[SELECTOR_BACKUPS_STORAGE_KEY], meaningfulOptions);
+    const lastGood = migrateOptionalSelectorState(result[SELECTOR_LAST_GOOD_STORAGE_KEY]);
+    const restoreSelector = backup?.selector
+      || (
+        lastGood && Store.isMeaningfulSelectorState(lastGood, meaningfulOptions)
+          ? lastGood
+          : null
+      );
+
+    if (!restoreSelector) {
+      setStatus("복구할 수 있는 내부 백업이 없습니다.", "warn");
+      return { ok: false, error: "No restorable backup." };
+    }
+
+    await saveSelectorState({ reason: "before-restore", explicit: true, forceBackup: true });
+    selectorState = migrateStoredSelectorState(restoreSelector);
+    await saveSelectorState({ reason: "restore-backup", explicit: true, skipBackup: true });
+    refreshPanelFromSelectorState();
+    const createdAt = backup?.createdAt ? ` (${backup.createdAt})` : "";
+    setStatus(`내부 백업을 복구했습니다${createdAt}.`, "ok");
+    return { ok: true };
+  }
+
   function bindPanelEvents() {
     ui.shell.addEventListener("wheel", blockPanelCtrlWheelZoom, { passive: false });
 
     bindCollapsedCardDrag();
+    if (ui.collapsedControls) {
+      for (const eventName of ["pointerdown", "click"]) {
+        ui.collapsedControls.addEventListener(eventName, (event) => event.stopPropagation());
+      }
+    }
     bindPanelTextareaKeyboard(ui.editor);
     bindPanelTextareaKeyboard(ui.quickInput);
     ui.collapseButton.addEventListener("click", () => setPanelCollapsed(true));
@@ -3564,31 +4375,47 @@
     ui.clearAllButton.addEventListener("click", () => {
       const slotData = getActiveSlotData();
       slotData.selectionState = "{}";
-      void saveSelectorState();
+      void saveSelectorState({ reason: "clear-leading-selection", explicit: true, forceBackup: true });
       renderPromptSelector();
-      setStatus("선행 프롬프트 선택을 모두 해제했습니다.", "ok");
+      setStatus(`${getPromptSelectionClearLabel()}을 모두 해제했습니다.`, "ok");
     });
 
     ui.suffixClearAllButton.addEventListener("click", () => {
       const slotData = getActiveSlotData();
       slotData.suffixSelectionState = "{}";
-      void saveSelectorState();
+      void saveSelectorState({ reason: "clear-suffix-selection", explicit: true, forceBackup: true });
       renderPromptSelector();
       setStatus("후행 프롬프트 선택을 모두 해제했습니다.", "ok");
     });
 
     ui.sampleButton.addEventListener("click", () => {
       const slotData = getActiveSlotData();
-      slotData.groupsDefinition = Core.DEFAULT_GROUPS_DEFINITION;
+      slotData.groupsDefinition = getSampleGroupsDefinitionForSlot(getActiveSlotId());
       slotData.selectionState = "{}";
       slotData.weightMemory = "{}";
       slotData.suffixSelectionState = "{}";
       slotData.suffixWeightMemory = "{}";
       ui.editor.value = slotData.groupsDefinition;
       renderEditorLineNumbers();
-      void saveSelectorState();
+      void saveSelectorState({ reason: "load-sample-groups", explicit: true, forceBackup: true });
       renderPromptSelector();
       setStatus("샘플 그룹을 불러왔습니다.", "ok");
+    });
+
+    ui.exportButton.addEventListener("click", exportSelectorState);
+
+    ui.importButton.addEventListener("click", () => {
+      ui.importFileInput?.click();
+    });
+
+    ui.importFileInput.addEventListener("change", () => {
+      const file = ui.importFileInput.files?.[0] || null;
+      ui.importFileInput.value = "";
+      void importSelectorFromFile(file);
+    });
+
+    ui.restoreButton.addEventListener("click", () => {
+      void restoreLatestSelectorBackup();
     });
 
     ui.copyButton.addEventListener("click", async () => {
@@ -3633,12 +4460,21 @@
       }
     });
 
+    ui.collapsedOpenButton.addEventListener("click", (event) => {
+      event.stopPropagation();
+      setPanelCollapsed(false);
+    });
+
     ui.sidebarAutoTab.addEventListener("click", () => {
       setActivePanelTab("auto");
     });
 
     ui.sidebarMainTab.addEventListener("click", () => {
-      setActivePanelTab("main");
+      setActivePanelTab("main", { preferredKind: "base" });
+    });
+
+    ui.sidebarNegativeTab.addEventListener("click", () => {
+      setActivePanelTab("main", { preferredKind: "uc" });
     });
 
     ui.refreshSlotsButton.addEventListener("click", () => {
@@ -3674,8 +4510,21 @@
       renderCharacterControls();
     });
 
+    ui.characterNameInput.addEventListener("focus", () => {
+      editingCharacterNameIndex = getActiveCharacterIndexFromPanelTab();
+    });
+
     ui.characterNameInput.addEventListener("input", () => {
       const index = getActiveCharacterIndexFromPanelTab();
+      if (!index) {
+        return;
+      }
+      editingCharacterNameIndex = index;
+    });
+
+    ui.characterNameInput.addEventListener("blur", () => {
+      const index = editingCharacterNameIndex || getActiveCharacterIndexFromPanelTab();
+      editingCharacterNameIndex = null;
       if (!index) {
         return;
       }
@@ -3685,18 +4534,46 @@
     });
 
     ui.intervalInput.addEventListener("change", () => {
-      void saveAutoSettingsFromPanel().then(() => setStatus("자동 생성 주기를 저장했습니다.", "ok"));
+      void saveAutoSettingsFromPanel({ source: "expanded" }).then(() => setStatus("자동 생성 주기를 저장했습니다.", "ok"));
     });
 
     ui.countInput.addEventListener("change", () => {
-      void saveAutoSettingsFromPanel().then(() => setStatus("자동 생성 횟수를 저장했습니다.", "ok"));
+      void saveAutoSettingsFromPanel({ source: "expanded" }).then(() => setStatus("자동 생성 횟수를 저장했습니다.", "ok"));
     });
 
     ui.countPresetButtons.forEach((button) => {
       button.addEventListener("click", () => {
         ui.countInput.value = button.dataset.count || "";
-        void saveAutoSettingsFromPanel().then(() => setStatus("자동 생성 횟수를 저장했습니다.", "ok"));
+        void saveAutoSettingsFromPanel({ source: "expanded" }).then(() => setStatus("자동 생성 횟수를 저장했습니다.", "ok"));
       });
+    });
+
+    ui.collapsedIntervalInput.addEventListener("change", () => {
+      void saveAutoSettingsFromPanel({ source: "collapsed" }).then(() => setStatus("자동 생성 주기를 저장했습니다.", "ok"));
+    });
+
+    ui.collapsedCountInput.addEventListener("change", () => {
+      void saveAutoSettingsFromPanel({ source: "collapsed" }).then(() => setStatus("자동 생성 횟수를 저장했습니다.", "ok"));
+    });
+
+    ui.collapsedCountPresetButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        ui.collapsedCountInput.value = button.dataset.count || "";
+        void saveAutoSettingsFromPanel({ source: "collapsed" }).then(() => setStatus("자동 생성 횟수를 저장했습니다.", "ok"));
+      });
+    });
+
+    ui.autoSaveToggle.addEventListener("change", () => {
+      void saveAutoPreferencesFromPanel().then(() => setStatus("자동 저장 설정을 저장했습니다.", "ok"));
+    });
+
+    ui.autoNotificationToggle.addEventListener("change", () => {
+      void saveAutoPreferencesFromPanel().then(() => setStatus("자동 생성 완료 알림 설정을 저장했습니다.", "ok"));
+    });
+
+    ui.autoVolumeSlider.addEventListener("input", () => {
+      setAutoPreferenceInputs({ volume: Number(ui.autoVolumeSlider.value) / 100 });
+      void saveAutoPreferencesFromPanel();
     });
 
     bindPanelViewportEvents();
@@ -3730,14 +4607,14 @@
         .nps-shell[data-collapsed="true"] .nps-panel { display: none; }
         .nps-shell[data-collapsed="false"] .nps-collapsed-card { display: none; }
         .nps-collapsed-card {
-          width: 224px;
+          width: min(116px, calc(100vw - 16px));
           display: grid;
-          grid-template-columns: minmax(0, 1fr) auto;
-          align-items: center;
-          gap: 10px;
-          padding: 9px;
+          grid-template-columns: minmax(0, 1fr);
+          align-items: stretch;
+          gap: 5px;
+          padding: 6px;
           border: 1px solid rgba(39, 214, 196, 0.48);
-          border-radius: 8px;
+          border-radius: 7px;
           background: #111820;
           color: #eafffb;
           box-shadow: 0 10px 28px rgba(0, 0, 0, 0.38);
@@ -3748,31 +4625,189 @@
         .nps-collapsed-card:active {
           cursor: grabbing;
         }
+        .nps-collapsed-open {
+          width: 100%;
+          min-height: 24px;
+          display: grid;
+          place-items: center;
+          border: 1px solid rgba(39, 214, 196, 0.38);
+          border-radius: 5px;
+          background: #172330;
+          color: #cffaf7;
+          padding: 0;
+          cursor: pointer;
+        }
+        .nps-collapsed-open:hover {
+          border-color: rgba(39, 214, 196, 0.68);
+          background: #20313f;
+          color: #f2fffd;
+        }
+        .nps-collapsed-open .nps-icon {
+          width: 15px;
+          height: 15px;
+        }
+        .nps-collapsed-main {
+          min-width: 0;
+          display: grid;
+          gap: 5px;
+        }
+        .nps-collapsed-summary {
+          display: none;
+        }
         .nps-collapsed-title {
-          font-size: 12px;
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          font-size: 10px;
           font-weight: 800;
+          line-height: 1;
           letter-spacing: 0;
         }
         .nps-collapsed-meta {
-          margin-top: 2px;
+          min-width: 0;
+          margin-top: 0;
           color: #aab8ba;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+          font-size: 10px;
+          line-height: 1;
+        }
+        .nps-collapsed-controls {
+          display: grid;
+          gap: 5px;
+          cursor: default;
+          touch-action: auto;
+        }
+        .nps-collapsed-fields {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr);
+          gap: 4px;
+        }
+        .nps-collapsed-field {
+          min-width: 0;
+          min-height: 22px;
+          display: grid;
+          grid-template-columns: 28px minmax(0, 1fr);
+          align-items: center;
+          gap: 4px;
+          color: #93a7ad;
+          font-size: 10px;
+          font-weight: 800;
+          line-height: 1;
+        }
+        .nps-collapsed-field span {
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .nps-collapsed-field input {
+          width: 100%;
+          min-height: 22px;
+          height: 22px;
+          border: 1px solid rgba(151, 170, 174, 0.32);
+          border-radius: 4px;
+          background: #0a1019;
+          color: #eef7f7;
+          padding: 2px 4px;
           font-size: 11px;
-          line-height: 1.25;
+          line-height: 1;
+        }
+        .nps-collapsed-field input::-webkit-outer-spin-button,
+        .nps-collapsed-field input::-webkit-inner-spin-button {
+          margin: 0;
+          -webkit-appearance: none;
+        }
+        .nps-collapsed-field input:focus {
+          outline: 1px solid rgba(39, 214, 196, 0.75);
+          border-color: rgba(39, 214, 196, 0.75);
+        }
+        .nps-collapsed-presets {
+          display: grid;
+          grid-template-columns: repeat(3, minmax(0, 1fr));
+          gap: 3px;
+        }
+        .nps-collapsed-presets button {
+          min-width: 0;
+          min-height: 22px;
+          height: 22px;
+          border: 1px solid rgba(151, 170, 174, 0.28);
+          border-radius: 4px;
+          background: #202a34;
+          color: #dce8ea;
+          padding: 1px 2px;
+          font-size: 10px;
+          font-weight: 800;
+          line-height: 1;
+          cursor: pointer;
+        }
+        .nps-collapsed-presets button:hover {
+          border-color: rgba(39, 214, 196, 0.56);
+          color: #f2fffd;
         }
         .nps-collapsed-auto {
-          min-width: 48px;
+          min-width: 0;
+          min-height: 38px;
+          display: grid;
+          grid-template-columns: 14px minmax(0, 1fr);
+          grid-template-rows: auto auto;
+          align-items: center;
+          justify-content: stretch;
+          column-gap: 5px;
+          row-gap: 2px;
           border: 1px solid rgba(39, 214, 196, 0.48);
-          border-radius: 6px;
+          border-radius: 5px;
           background: #243f3f;
           color: #f2fffd;
-          padding: 7px 8px;
-          font-size: 12px;
+          padding: 5px 6px;
+          font-size: 10px;
           font-weight: 800;
+          line-height: 1;
           cursor: pointer;
+        }
+        .nps-collapsed-auto .nps-icon {
+          width: 13px;
+          height: 13px;
+          grid-row: 1 / 3;
+        }
+        .nps-collapsed-auto .nps-btn-label,
+        .nps-collapsed-auto .nps-collapsed-count {
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .nps-collapsed-auto .nps-btn-label {
+          font-size: 11px;
+        }
+        .nps-collapsed-auto .nps-collapsed-count {
+          color: #aab8ba;
+          font-size: 9px;
         }
         .nps-collapsed-auto[data-active="true"] {
           border-color: rgba(255, 149, 118, 0.58);
           background: #3d2528;
+        }
+        .nps-icon-expand::before,
+        .nps-icon-expand::after {
+          content: "";
+          position: absolute;
+          width: 7px;
+          height: 7px;
+          border-color: currentColor;
+          border-style: solid;
+        }
+        .nps-icon-expand::before {
+          top: 1px;
+          right: 1px;
+          border-width: 1.6px 1.6px 0 0;
+        }
+        .nps-icon-expand::after {
+          left: 1px;
+          bottom: 1px;
+          border-width: 0 0 1.6px 1.6px;
         }
         .nps-panel {
           width: min(720px, calc(100vw - 24px));
@@ -3799,6 +4834,7 @@
         .nps-subtitle { color: #aab8ba; font-size: 11px; margin-top: 2px; }
         .nps-header button,
         .nps-actions button,
+        .nps-storage-actions button,
         .nps-group-actions button,
         .nps-section-head button,
         .nps-character-name-row button,
@@ -3814,6 +4850,7 @@
         }
         .nps-header button:hover,
         .nps-actions button:hover,
+        .nps-storage-actions button:hover,
         .nps-group-actions button:hover,
         .nps-section-head button:hover,
         .nps-character-name-row button:hover,
@@ -3832,6 +4869,14 @@
         .nps-actions button:first-child {
           background: #243f3f;
           border-color: rgba(39, 214, 196, 0.55);
+        }
+        .nps-storage-actions {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .nps-storage-actions button {
+          flex: 1 1 120px;
         }
         .nps-status {
           min-height: 28px;
@@ -3926,10 +4971,7 @@
           background: #18222b;
         }
         .nps-character-tab.is-disabled::after {
-          content: " off";
-          color: #ffbe79;
-          font-size: 10px;
-          font-weight: 800;
+          content: none;
         }
         .nps-character-tab.is-dragging {
           opacity: 0.5;
@@ -4390,6 +5432,773 @@
           font-size: 12px;
           line-height: 1.45;
         }
+        .nps-panel {
+          width: min(728px, calc(100vw - 24px));
+          border-color: rgba(132, 151, 167, 0.28);
+          border-radius: 7px;
+          background: #0c121c;
+          box-shadow: 0 22px 70px rgba(0, 0, 0, 0.5);
+        }
+        .nps-header {
+          min-height: 58px;
+          padding: 13px 18px;
+          background: linear-gradient(180deg, #131a25 0%, #101722 100%);
+        }
+        .nps-header-main {
+          display: grid;
+          grid-template-columns: minmax(0, auto) auto;
+          align-items: center;
+          gap: 22px;
+          min-width: 0;
+        }
+        .nps-title {
+          color: #f4f7fb;
+          font-size: 17px;
+          font-weight: 750;
+          line-height: 1.1;
+        }
+        .nps-header-state {
+          display: inline-flex;
+          align-items: center;
+          gap: 7px;
+          color: #d7e0e6;
+          font-size: 12px;
+          white-space: nowrap;
+        }
+        .nps-state-dot {
+          width: 8px;
+          height: 8px;
+          flex: 0 0 auto;
+          border-radius: 999px;
+          background: #35d676;
+          box-shadow: 0 0 0 3px rgba(53, 214, 118, 0.12);
+        }
+        .nps-shortcuts-menu {
+          position: relative;
+          display: inline-flex;
+          align-items: center;
+          margin-left: 1px;
+        }
+        .nps-shortcuts-menu summary {
+          width: 22px;
+          height: 22px;
+          display: grid;
+          place-items: center;
+          list-style: none;
+          border: 1px solid rgba(132, 151, 167, 0.18);
+          border-radius: 5px;
+          background: transparent;
+          color: #87939e;
+          cursor: pointer;
+          user-select: none;
+        }
+        .nps-shortcuts-menu summary::-webkit-details-marker {
+          display: none;
+        }
+        .nps-shortcuts-menu summary:hover,
+        .nps-shortcuts-menu[open] summary {
+          border-color: rgba(132, 151, 167, 0.38);
+          background: rgba(132, 151, 167, 0.1);
+          color: #c1ccd4;
+        }
+        .nps-shortcuts-panel {
+          position: absolute;
+          top: calc(100% + 8px);
+          right: 0;
+          z-index: 2147483203;
+          width: min(260px, calc(100vw - 40px));
+          display: grid;
+          gap: 7px;
+          padding: 9px;
+          border: 1px solid rgba(132, 151, 167, 0.3);
+          border-radius: 7px;
+          background: #0e1520;
+          box-shadow: 0 18px 42px rgba(0, 0, 0, 0.46);
+        }
+        .nps-shortcuts-menu:not([open]) .nps-shortcuts-panel {
+          display: none;
+        }
+        .nps-shortcut-row {
+          display: grid;
+          grid-template-columns: max-content minmax(0, 1fr);
+          align-items: center;
+          gap: 10px;
+          font-size: 12px;
+          line-height: 1.25;
+        }
+        .nps-shortcut-keys {
+          padding: 3px 5px;
+          border: 1px solid rgba(132, 151, 167, 0.22);
+          border-radius: 4px;
+          background: rgba(132, 151, 167, 0.1);
+          color: #d8e0e6;
+          font-family: Consolas, "Courier New", monospace;
+          font-size: 11px;
+          white-space: nowrap;
+        }
+        .nps-shortcut-label {
+          min-width: 0;
+          color: #d7e0e6;
+          overflow-wrap: anywhere;
+        }
+        .nps-collapse {
+          width: 28px;
+          height: 28px;
+          display: grid;
+          place-items: center;
+          padding: 0 !important;
+          border-color: transparent !important;
+          background: transparent !important;
+        }
+        .nps-actions {
+          grid-template-columns: repeat(3, minmax(0, 1fr)) minmax(110px, 0.9fr);
+          gap: 9px;
+          padding: 10px 18px;
+          background: #0f1622;
+        }
+        .nps-actions button,
+        .nps-more-menu summary {
+          min-height: 34px;
+          display: inline-flex;
+          align-items: center;
+          justify-content: center;
+          gap: 9px;
+          border: 1px solid rgba(132, 151, 167, 0.28);
+          border-radius: 6px;
+          background: rgba(19, 27, 39, 0.82);
+          color: #edf3f7;
+          padding: 7px 11px;
+          font-size: 13px;
+          font-weight: 650;
+          line-height: 1;
+          cursor: pointer;
+        }
+        .nps-actions button:hover,
+        .nps-more-menu summary:hover {
+          border-color: rgba(54, 205, 224, 0.56);
+          background: rgba(26, 37, 52, 0.95);
+        }
+        .nps-actions button:first-child {
+          background: rgba(19, 27, 39, 0.82);
+          border-color: rgba(132, 151, 167, 0.28);
+        }
+        .nps-auto[data-active="true"] {
+          border-color: rgba(255, 127, 99, 0.58);
+          background: rgba(70, 30, 32, 0.78);
+          color: #ffd5cc;
+        }
+        .nps-more-menu {
+          position: relative;
+          min-width: 0;
+        }
+        .nps-more-menu summary {
+          width: 100%;
+          list-style: none;
+          user-select: none;
+        }
+        .nps-more-menu summary::-webkit-details-marker {
+          display: none;
+        }
+        .nps-more-panel {
+          position: absolute;
+          top: calc(100% + 7px);
+          right: 0;
+          z-index: 2147483202;
+          width: 238px;
+          display: flex;
+          flex-direction: column;
+          gap: 5px;
+          padding: 7px;
+          border: 1px solid rgba(132, 151, 167, 0.3);
+          border-radius: 7px;
+          background: #0e1520;
+          box-shadow: 0 18px 42px rgba(0, 0, 0, 0.46);
+        }
+        .nps-more-menu:not([open]) .nps-more-panel {
+          display: none;
+        }
+        .nps-more-panel button,
+        .nps-storage-actions button {
+          width: 100%;
+          flex: 0 0 auto;
+          justify-content: flex-start;
+          min-height: 28px;
+          padding: 6px 8px;
+          font-size: 12px;
+          font-weight: 600;
+        }
+        .nps-more-settings {
+          display: grid;
+          gap: 7px;
+          padding: 7px 0;
+          border-top: 1px solid rgba(132, 151, 167, 0.16);
+          border-bottom: 1px solid rgba(132, 151, 167, 0.16);
+        }
+        .nps-more-title {
+          color: #91a4b0;
+          font-size: 11px;
+          font-weight: 800;
+        }
+        .nps-menu-check {
+          display: grid;
+          grid-template-columns: auto minmax(0, 1fr);
+          align-items: center;
+          gap: 7px;
+          min-height: 28px;
+          border: 1px solid rgba(132, 151, 167, 0.18);
+          border-radius: 6px;
+          background: rgba(18, 26, 37, 0.58);
+          color: #dce6eb;
+          padding: 6px 7px;
+          font-size: 12px;
+          font-weight: 650;
+          line-height: 1.2;
+          cursor: pointer;
+        }
+        .nps-menu-check input {
+          width: 14px;
+          height: 14px;
+          margin: 0;
+          accent-color: #27d6c4;
+        }
+        .nps-menu-range {
+          display: grid;
+          grid-template-columns: minmax(0, 1fr) auto;
+          align-items: center;
+          gap: 6px;
+          border: 1px solid rgba(132, 151, 167, 0.18);
+          border-radius: 6px;
+          background: rgba(18, 26, 37, 0.58);
+          color: #dce6eb;
+          padding: 6px 7px;
+          font-size: 12px;
+          font-weight: 650;
+        }
+        .nps-menu-range input {
+          grid-column: 1 / -1;
+          width: 100%;
+          accent-color: #27d6c4;
+        }
+        .nps-volume-value {
+          color: #91a4b0;
+          font-size: 11px;
+          font-weight: 800;
+        }
+        .nps-storage-actions {
+          display: flex;
+          flex-direction: column;
+          gap: 5px;
+          padding-top: 0;
+          margin-top: 0;
+          border-top: 0;
+        }
+        .nps-status {
+          min-height: 0;
+          padding: 8px 18px;
+          background: #0d141f;
+          color: #92a5b2;
+          font-size: 11px;
+          border-bottom-color: rgba(132, 151, 167, 0.14);
+        }
+        .nps-status:empty {
+          display: none;
+        }
+        .nps-status[data-tone="ok"] { color: #82e7ca; }
+        .nps-status[data-tone="warn"] { color: #f5bf75; }
+        .nps-panel-grid {
+          grid-template-columns: 180px minmax(0, 1fr);
+        }
+        .nps-sidebar {
+          gap: 6px;
+          padding: 16px 10px;
+          background: linear-gradient(180deg, #101824 0%, #0e151f 100%);
+          border-right-color: rgba(132, 151, 167, 0.18);
+        }
+        .nps-sidebar-label {
+          margin: 10px 8px 4px;
+          color: #7d8c98;
+          font-size: 11px;
+          font-weight: 650;
+          text-transform: none;
+        }
+        .nps-sidebar-label:first-child {
+          margin-top: 0;
+        }
+        .nps-sidebar-tab,
+        .nps-sidebar-add {
+          display: flex;
+          align-items: center;
+          gap: 9px;
+          min-height: 31px;
+          border-color: transparent;
+          border-radius: 6px;
+          background: transparent;
+          color: #cbd5dc;
+          padding: 7px 9px;
+          font-size: 12px;
+          font-weight: 570;
+        }
+        .nps-sidebar-tab > span:last-child,
+        .nps-sidebar-add > span:last-child {
+          min-width: 0;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .nps-sidebar-tab:hover,
+        .nps-sidebar-add:hover {
+          border-color: rgba(132, 151, 167, 0.2);
+          background: rgba(255, 255, 255, 0.035);
+        }
+        .nps-sidebar-tab.is-active {
+          background: rgba(53, 205, 226, 0.08);
+          border-color: rgba(53, 205, 226, 0.18);
+          color: #8df2ff;
+          font-weight: 700;
+          box-shadow: inset 3px 0 0 #35cde2;
+        }
+        .nps-character-tabs {
+          gap: 5px;
+          max-height: min(330px, calc(100vh - 350px));
+        }
+        .nps-character-tab {
+          position: relative;
+          padding-left: 25px;
+        }
+        .nps-character-tab::before {
+          content: "";
+          position: absolute;
+          left: 9px;
+          top: 50%;
+          width: 8px;
+          height: 8px;
+          border-radius: 999px;
+          background: #6f7f8b;
+          transform: translateY(-50%);
+        }
+        .nps-character-tab.is-active::before {
+          background: #61def2;
+          box-shadow: 0 0 0 3px rgba(97, 222, 242, 0.12);
+        }
+        .nps-character-tab.is-disabled {
+          color: #75828d;
+          border-style: solid;
+          background: transparent;
+        }
+        .nps-character-tab.is-disabled::before {
+          left: 8px;
+          width: 10px;
+          height: 10px;
+          border: 1.3px solid #74828d;
+          border-radius: 75% 15%;
+          background: radial-gradient(circle at 50% 50%, #74828d 0 1.8px, transparent 2.1px);
+          box-shadow: none;
+          transform: translateY(-50%) rotate(45deg);
+        }
+        .nps-character-tab.is-disabled::after {
+          content: "";
+          position: absolute;
+          left: 6px;
+          top: 50%;
+          width: 16px;
+          height: 1.7px;
+          margin-left: 0;
+          border-radius: 999px;
+          background: #ffbe79;
+          box-shadow: 0 0 0 1px rgba(15, 22, 34, 0.72);
+          transform: translateY(-50%) rotate(-45deg);
+          pointer-events: none;
+        }
+        .nps-sidebar-add {
+          margin-top: auto;
+          min-height: 32px;
+          justify-content: flex-start;
+          border-color: rgba(132, 151, 167, 0.24);
+          background: transparent;
+          color: #d8e1e7;
+          font-size: 12px;
+          font-weight: 600;
+        }
+        .nps-sidebar-add span:first-child {
+          color: #8df2ff;
+          font-size: 18px;
+          line-height: 1;
+        }
+        .nps-body {
+          gap: 11px;
+          padding: 16px 18px 18px;
+          background: #0c121c;
+        }
+        .nps-tab-view {
+          gap: 13px;
+        }
+        .nps-section {
+          gap: 7px;
+        }
+        .nps-editor-context {
+          padding-bottom: 3px;
+        }
+        .nps-section-head {
+          min-height: 24px;
+        }
+        .nps-section-title {
+          color: #eef4f8;
+          font-size: 13px;
+          font-weight: 720;
+        }
+        .nps-section-meta {
+          color: #8c9ba7;
+          font-size: 11px;
+        }
+        .nps-segments[hidden] {
+          display: none;
+        }
+        .nps-segments {
+          flex: 0 0 auto;
+          flex-wrap: nowrap;
+          padding: 2px;
+          border: 1px solid rgba(132, 151, 167, 0.22);
+          border-radius: 6px;
+          background: rgba(8, 13, 20, 0.5);
+        }
+        .nps-segment {
+          min-height: 26px;
+          border: 0;
+          border-radius: 4px;
+          background: transparent;
+          color: #cbd5dc;
+          padding: 5px 10px;
+          font-size: 12px;
+        }
+        .nps-segment.is-active {
+          background: rgba(53, 205, 226, 0.13);
+          border-color: transparent;
+          color: #96f3ff;
+          box-shadow: inset 0 0 0 1px rgba(53, 205, 226, 0.32);
+        }
+        .nps-flow-section {
+          position: relative;
+          padding-left: 31px;
+        }
+        .nps-flow-section::before {
+          content: attr(data-step);
+          position: absolute;
+          left: 0;
+          top: 1px;
+          width: 20px;
+          height: 20px;
+          display: grid;
+          place-items: center;
+          border: 1px solid rgba(132, 151, 167, 0.34);
+          border-radius: 999px;
+          color: #c5d0d8;
+          background: #111925;
+          font-size: 11px;
+          font-weight: 700;
+        }
+        .nps-flow-section:not(:last-child)::after {
+          content: "";
+          position: absolute;
+          left: 9px;
+          top: 28px;
+          bottom: -8px;
+          width: 1px;
+          background: linear-gradient(180deg, rgba(132, 151, 167, 0.26), rgba(132, 151, 167, 0));
+        }
+        .nps-editor-view .nps-flow-section:last-child {
+          margin-bottom: 16px;
+        }
+        .nps-editor-view {
+          padding-bottom: 18px;
+        }
+        .nps-editor-view::after {
+          content: "";
+          display: block;
+          flex: 0 0 18px;
+        }
+        .nps-editor-shell {
+          height: 96px;
+          min-height: 96px;
+          grid-template-columns: 38px minmax(0, 1fr);
+          border-color: rgba(132, 151, 167, 0.26);
+          border-radius: 6px;
+          background: #0a1019;
+        }
+        .nps-editor-line-numbers {
+          background: rgba(255, 255, 255, 0.025);
+          color: #667584;
+          font-size: 11px;
+          padding: 8px 7px 8px 5px;
+        }
+        .nps-editor,
+        .nps-quick,
+        .nps-preview {
+          color: #e8eef3;
+          font-size: 12px;
+          line-height: 1.5;
+          font-family: Consolas, "Courier New", monospace;
+        }
+        .nps-editor {
+          padding: 8px 10px;
+        }
+        .nps-quick {
+          min-height: 72px;
+          border-color: rgba(132, 151, 167, 0.26);
+          border-radius: 6px;
+          background: #0a1019;
+        }
+        .nps-group {
+          border-color: transparent;
+          border-radius: 0;
+          background: transparent;
+          padding: 0;
+        }
+        .nps-group + .nps-group {
+          padding-top: 7px;
+          border-top: 1px solid rgba(132, 151, 167, 0.14);
+        }
+        .nps-group-header {
+          align-items: center;
+          margin-bottom: 7px;
+        }
+        .nps-group-title {
+          color: #e9f0f4;
+          font-size: 12px;
+        }
+        .nps-group-meta {
+          color: #8796a2;
+          font-size: 11px;
+        }
+        .nps-group-actions button,
+        .nps-section-head button {
+          min-height: 24px;
+          border-color: transparent;
+          background: transparent;
+          color: #aab7c1;
+          padding: 3px 6px;
+          font-size: 11px;
+        }
+        .nps-group-actions button:hover,
+        .nps-section-head button:hover {
+          color: #91f2ff;
+          border-color: rgba(53, 205, 226, 0.22);
+          background: rgba(53, 205, 226, 0.06);
+        }
+        .nps-chips {
+          gap: 7px;
+        }
+        .nps-chip {
+          min-height: 29px;
+          border-color: rgba(132, 151, 167, 0.28);
+          border-radius: 5px;
+          background: rgba(18, 26, 37, 0.84);
+          color: #dbe4ea;
+          padding: 6px 9px;
+          font-size: 12px;
+        }
+        .nps-chip.is-active {
+          background: rgba(33, 77, 89, 0.48);
+          border-color: rgba(53, 205, 226, 0.72);
+          color: #aef6ff;
+          box-shadow: none;
+        }
+        .nps-chip.is-active.is-boosted,
+        .nps-chip.is-active.is-weakened {
+          background: rgba(33, 77, 89, 0.36);
+          border-color: rgba(53, 205, 226, 0.52);
+          color: #d9f8ff;
+          box-shadow: none;
+        }
+        .nps-chip-weight {
+          border-radius: 999px;
+          padding: 1px 6px;
+          font-size: 10px;
+          font-weight: 800;
+        }
+        .nps-chip.is-active.is-boosted .nps-chip-weight {
+          background: rgba(224, 89, 69, 0.28) !important;
+          color: #ffb5aa !important;
+        }
+        .nps-chip.is-active.is-weakened .nps-chip-weight {
+          background: rgba(77, 132, 226, 0.24) !important;
+          color: #b6d4ff !important;
+        }
+        .nps-preview {
+          min-height: 74px;
+          max-height: 130px;
+          border-color: rgba(132, 151, 167, 0.24);
+          border-radius: 6px;
+          background: #0a1019;
+          padding: 10px;
+        }
+        .nps-character-editor-tools {
+          border-color: rgba(132, 151, 167, 0.2);
+          background: rgba(16, 24, 36, 0.62);
+          padding: 9px;
+        }
+        .nps-settings-grid {
+          gap: 10px;
+        }
+        .nps-field label {
+          color: #8c9ba7;
+        }
+        .nps-field input {
+          border-color: rgba(132, 151, 167, 0.26);
+          background: #0a1019;
+        }
+        .nps-count-presets button {
+          min-width: 56px;
+          border-color: rgba(132, 151, 167, 0.24);
+          background: rgba(18, 26, 37, 0.84);
+        }
+        .nps-icon {
+          position: relative;
+          width: 15px;
+          height: 15px;
+          display: inline-block;
+          flex: 0 0 auto;
+          color: currentColor;
+        }
+        .nps-icon-check::before {
+          content: "";
+          position: absolute;
+          left: 2px;
+          top: 3px;
+          width: 11px;
+          height: 8px;
+          border: solid currentColor;
+          border-width: 0 0 2px 2px;
+          border-radius: 0 0 0 2px;
+          transform: rotate(-45deg);
+        }
+        .nps-icon-check::after {
+          content: none;
+        }
+        .nps-icon-play::before {
+          content: "";
+          position: absolute;
+          left: 4px;
+          top: 2px;
+          border-left: 9px solid currentColor;
+          border-top: 6px solid transparent;
+          border-bottom: 6px solid transparent;
+        }
+        .nps-icon-stop::before {
+          content: "";
+          position: absolute;
+          inset: 3px;
+          border-radius: 2px;
+          background: currentColor;
+        }
+        .nps-icon-minus::before {
+          content: "";
+          position: absolute;
+          left: 2px;
+          right: 2px;
+          top: 7px;
+          height: 1.7px;
+          background: currentColor;
+          border-radius: 999px;
+        }
+        .nps-icon-more::before {
+          content: "";
+          position: absolute;
+          left: 1px;
+          top: 6px;
+          width: 3px;
+          height: 3px;
+          border-radius: 999px;
+          background: currentColor;
+          box-shadow: 5px 0 currentColor, 10px 0 currentColor;
+        }
+        .nps-icon-chevron::before {
+          content: "";
+          position: absolute;
+          left: 4px;
+          top: 4px;
+          width: 6px;
+          height: 6px;
+          border: solid currentColor;
+          border-width: 0 1.6px 1.6px 0;
+          transform: rotate(45deg);
+        }
+        .nps-icon-keyboard {
+          width: 14px;
+          height: 14px;
+        }
+        .nps-icon-keyboard::before {
+          content: "";
+          position: absolute;
+          inset: 2px 1px 3px;
+          border: 1.4px solid currentColor;
+          border-radius: 2.5px;
+        }
+        .nps-icon-keyboard::after {
+          content: "";
+          position: absolute;
+          left: 4px;
+          top: 5px;
+          width: 1.5px;
+          height: 1.5px;
+          border-radius: 999px;
+          background: currentColor;
+          box-shadow: 3px 0 currentColor, 6px 0 currentColor, -1.5px 3px currentColor, 1.5px 3px currentColor, 4.5px 3px currentColor, 7.5px 3px currentColor;
+          opacity: 0.82;
+        }
+        .nps-icon-auto::before {
+          content: "";
+          position: absolute;
+          left: 4px;
+          top: 1px;
+          width: 8px;
+          height: 13px;
+          background: currentColor;
+          clip-path: polygon(58% 0, 16% 52%, 45% 52%, 33% 100%, 86% 39%, 56% 39%);
+        }
+        .nps-icon-auto::after {
+          content: none;
+        }
+        .nps-icon-prompt::before,
+        .nps-icon-doc::before {
+          content: "";
+          position: absolute;
+          inset: 2px 3px;
+          border: 1.5px solid currentColor;
+          border-radius: 2px;
+        }
+        .nps-icon-prompt::after {
+          content: "";
+          position: absolute;
+          left: 5px;
+          right: 5px;
+          top: 6px;
+          height: 1.3px;
+          background: currentColor;
+          box-shadow: 0 4px currentColor;
+        }
+        .nps-icon-doc::after {
+          content: "";
+          position: absolute;
+          left: 5px;
+          right: 4px;
+          top: 5px;
+          height: 1.2px;
+          background: currentColor;
+          box-shadow: 0 3px currentColor, 0 6px currentColor;
+          opacity: 0.75;
+        }
+        .nps-auto-dot {
+          width: 18px;
+          height: 18px;
+          border: 1px solid rgba(132, 151, 167, 0.42);
+          border-radius: 999px;
+          background: rgba(132, 151, 167, 0.22);
+          box-shadow: inset 0 0 0 3px #0f1622;
+        }
+        .nps-auto[data-active="true"] .nps-auto-dot {
+          border-color: rgba(255, 127, 99, 0.8);
+          background: #ff7f63;
+        }
         @media (max-width: 520px) {
           :host {
             right: 8px;
@@ -4422,42 +6231,164 @@
       </style>
       <div class="nps-shell" data-collapsed="true">
         <div class="nps-collapsed-card" title="드래그로 이동, 클릭으로 열기">
-          <div>
-            <div class="nps-collapsed-title">NAI Auto</div>
-            <div class="nps-collapsed-meta">완료/설정: <span class="nps-collapsed-count">0 / ∞</span></div>
+          <button class="nps-collapsed-open" type="button" aria-label="패널 열기" title="패널 열기">
+            <span class="nps-icon nps-icon-expand" aria-hidden="true"></span>
+          </button>
+          <div class="nps-collapsed-main">
+            <div class="nps-collapsed-summary">
+              <div class="nps-collapsed-title">NAI 자동</div>
+              <div class="nps-collapsed-meta">완료 <span>0 / ∞</span></div>
+            </div>
+            <div class="nps-collapsed-controls">
+              <div class="nps-collapsed-fields">
+                <label class="nps-collapsed-field">
+                  <span>주기</span>
+                  <input class="nps-collapsed-interval-input" type="number" min="0.1" step="0.1" placeholder="초" aria-label="자동 생성 주기(초)">
+                </label>
+                <label class="nps-collapsed-field">
+                  <span>횟수</span>
+                  <input class="nps-collapsed-count-input" type="number" min="0" step="1" placeholder="횟수" aria-label="자동 생성 횟수">
+                </label>
+              </div>
+              <div class="nps-collapsed-presets" aria-label="접힌 패널 자동 생성 횟수">
+                <button type="button" data-count="5">5</button>
+                <button type="button" data-count="10">10</button>
+                <button type="button" data-count="20">20</button>
+                <button type="button" data-count="30">30</button>
+                <button type="button" data-count="50">50</button>
+                <button type="button" data-count="">∞</button>
+              </div>
+            </div>
           </div>
-          <button class="nps-collapsed-auto" type="button">시작</button>
+          <button class="nps-collapsed-auto" type="button">
+            <span class="nps-icon nps-icon-play" aria-hidden="true"></span>
+            <span class="nps-btn-label">시작</span>
+            <span class="nps-collapsed-count">0 / ∞</span>
+          </button>
         </div>
         <aside class="nps-panel">
           <header class="nps-header">
-            <div>
+            <div class="nps-header-main">
               <div class="nps-title">NAI-Prompt-Selector</div>
-              <div class="nps-subtitle">PromptSelector + auto generation</div>
+              <div class="nps-header-state">
+                <span class="nps-state-dot" aria-hidden="true"></span>
+                <span>연결됨</span>
+                <details class="nps-shortcuts-menu">
+                  <summary aria-label="단축키 목록 보기" title="단축키 목록">
+                    <span class="nps-icon nps-icon-keyboard" aria-hidden="true"></span>
+                  </summary>
+                  <div class="nps-shortcuts-panel" role="list" aria-label="페이지 단축키">
+                    <div class="nps-shortcut-row" role="listitem">
+                      <span class="nps-shortcut-keys">Ctrl + Space</span>
+                      <span class="nps-shortcut-label">현재 슬롯 적용</span>
+                    </div>
+                    <div class="nps-shortcut-row" role="listitem">
+                      <span class="nps-shortcut-keys">Ctrl + Shift + Space</span>
+                      <span class="nps-shortcut-label">전체 슬롯 적용</span>
+                    </div>
+                    <div class="nps-shortcut-row" role="listitem">
+                      <span class="nps-shortcut-keys">Ctrl + Enter</span>
+                      <span class="nps-shortcut-label">자동 생성 시작</span>
+                    </div>
+                    <div class="nps-shortcut-row" role="listitem">
+                      <span class="nps-shortcut-keys">Ctrl + Alt + Enter</span>
+                      <span class="nps-shortcut-label">자동 생성 취소</span>
+                    </div>
+                    <div class="nps-shortcut-row" role="listitem">
+                      <span class="nps-shortcut-keys">Ctrl + \`</span>
+                      <span class="nps-shortcut-label">패널 접기/펼치기</span>
+                    </div>
+                    <div class="nps-shortcut-row" role="listitem">
+                      <span class="nps-shortcut-keys">Ctrl + Wheel</span>
+                      <span class="nps-shortcut-label">프롬프트 칩 가중치 조절</span>
+                    </div>
+                  </div>
+                </details>
+              </div>
             </div>
-            <button class="nps-collapse" type="button">접기</button>
+            <button class="nps-collapse" type="button" aria-label="패널 접기">
+              <span class="nps-icon nps-icon-minus" aria-hidden="true"></span>
+            </button>
           </header>
           <div class="nps-actions">
-            <button class="nps-apply" type="button">현재 슬롯 적용</button>
-            <button class="nps-apply-all" type="button">전체 슬롯 적용</button>
-            <button class="nps-generate" type="button">1회 생성</button>
-            <button class="nps-auto" type="button">자동 생성</button>
+            <button class="nps-apply" type="button">
+              <span class="nps-icon nps-icon-check" aria-hidden="true"></span>
+              <span>적용</span>
+            </button>
+            <button class="nps-generate" type="button">
+              <span class="nps-icon nps-icon-play" aria-hidden="true"></span>
+              <span>생성</span>
+            </button>
+            <button class="nps-auto" type="button">
+              <span class="nps-auto-dot" aria-hidden="true"></span>
+              <span class="nps-btn-label">자동</span>
+            </button>
+            <details class="nps-more-menu">
+              <summary>
+                <span class="nps-icon nps-icon-more" aria-hidden="true"></span>
+                <span>더보기</span>
+                <span class="nps-icon nps-icon-chevron" aria-hidden="true"></span>
+              </summary>
+              <div class="nps-more-panel">
+                <button class="nps-apply-all" type="button">전체 슬롯 적용</button>
+                <button class="nps-refresh-slots" type="button">슬롯 새로고침</button>
+                <button class="nps-sample" type="button">샘플 그룹 불러오기</button>
+                <div class="nps-more-settings">
+                  <div class="nps-more-title">자동 생성 설정</div>
+                  <label class="nps-menu-check">
+                    <input class="nps-auto-save-toggle" type="checkbox">
+                    <span>완료 이미지 자동 저장</span>
+                  </label>
+                  <label class="nps-menu-range">
+                    <span>시작/중지 볼륨</span>
+                    <span class="nps-volume-value">50%</span>
+                    <input class="nps-volume-slider" type="range" min="0" max="100" step="1">
+                  </label>
+                  <label class="nps-menu-check">
+                    <input class="nps-auto-notification-toggle" type="checkbox">
+                    <span>자동생성 완료 알림</span>
+                  </label>
+                </div>
+                <div class="nps-storage-actions">
+                  <button class="nps-export" type="button">JSON 내보내기</button>
+                  <button class="nps-import" type="button">JSON 가져오기</button>
+                  <button class="nps-restore" type="button">백업 복구</button>
+                  <input class="nps-import-file" type="file" accept="application/json,.json" hidden>
+                </div>
+              </div>
+            </details>
           </div>
           <div class="nps-status" data-tone="neutral"></div>
           <div class="nps-panel-grid">
-            <nav class="nps-sidebar" aria-label="NAI-Prompt-Selector tabs">
-              <button class="nps-sidebar-tab nps-sidebar-auto" type="button">자동 생성 설정</button>
-              <button class="nps-sidebar-tab nps-sidebar-main" type="button">Base / Main UC</button>
-              <div class="nps-sidebar-label">Characters</div>
+            <nav class="nps-sidebar" aria-label="NAI-Prompt-Selector 탭">
+              <div class="nps-sidebar-label">모드</div>
+              <button class="nps-sidebar-tab nps-sidebar-auto" type="button">
+                <span class="nps-icon nps-icon-auto" aria-hidden="true"></span>
+                <span>자동 생성</span>
+              </button>
+              <div class="nps-sidebar-label">슬롯</div>
+              <button class="nps-sidebar-tab nps-sidebar-main" type="button">
+                <span class="nps-icon nps-icon-prompt" aria-hidden="true"></span>
+                <span>메인 프롬프트</span>
+              </button>
+              <button class="nps-sidebar-tab nps-sidebar-negative" type="button">
+                <span class="nps-icon nps-icon-doc" aria-hidden="true"></span>
+                <span>네거티브 프롬프트</span>
+              </button>
+              <div class="nps-sidebar-label">캐릭터</div>
               <div class="nps-character-tabs"></div>
-              <button class="nps-add-character nps-sidebar-add" type="button" data-kind="Other" title="Other 캐릭터 추가">+</button>
+            <button class="nps-add-character nps-sidebar-add" type="button" data-kind="Other" title="기타 캐릭터 추가">
+                <span aria-hidden="true">+</span>
+                <span>캐릭터 추가</span>
+              </button>
             </nav>
             <div class="nps-body">
               <section class="nps-tab-view nps-auto-view">
                 <section class="nps-section">
                   <div class="nps-section-head">
                     <div>
-                      <div class="nps-section-title">Auto Generation</div>
-                      <div class="nps-section-meta">횟수 비우기 또는 0 = 무제한</div>
+                      <div class="nps-section-title">자동 생성</div>
+                      <div class="nps-section-meta">횟수를 비우거나 0으로 두면 무제한으로 생성합니다</div>
                     </div>
                   </div>
                   <div class="nps-settings-grid">
@@ -4481,40 +6412,38 @@
                 </section>
               </section>
               <section class="nps-tab-view nps-editor-view" hidden>
-                <section class="nps-section">
+                <section class="nps-section nps-editor-context">
                   <div class="nps-section-head">
                     <div>
-                      <div class="nps-section-title nps-slot-mode-title">Base / Main UC</div>
-                      <div class="nps-section-meta">현재 편집: <span class="nps-active-slot">Base</span></div>
+                      <div class="nps-section-title nps-slot-mode-title">메인 프롬프트 편집</div>
+                      <div class="nps-section-meta">현재 슬롯: <span class="nps-active-slot">메인 프롬프트</span></div>
                     </div>
-                    <button class="nps-refresh-slots" type="button">Refresh</button>
+                    <div class="nps-segments nps-slot-mode-tabs"></div>
                   </div>
-                  <div class="nps-segments nps-slot-mode-tabs"></div>
                 </section>
                 <section class="nps-section nps-character-editor-tools" hidden>
                   <div class="nps-character-name-row">
                     <div class="nps-field">
                       <label for="nps-character-name-input">캐릭터 이름</label>
-                      <input id="nps-character-name-input" class="nps-character-name-input" type="text" maxlength="48" placeholder="Char">
+                      <input id="nps-character-name-input" class="nps-character-name-input" type="text" maxlength="48" placeholder="캐릭터">
                     </div>
                     <button class="nps-character-enabled" type="button">비활성화</button>
                     <button class="nps-delete-character nps-character-delete" type="button">삭제</button>
                     <div class="nps-delete-confirm" hidden>
-                      <span>정말 삭제할까요?</span>
+                      <span>이 캐릭터를 삭제할까요?</span>
                       <button class="nps-confirm-delete" type="button">삭제 확정</button>
                       <button class="nps-cancel-delete" type="button">취소</button>
                     </div>
                   </div>
                   <div class="nps-character-disabled-banner" hidden>이 캐릭터는 NovelAI에서 비활성화되어 있습니다.</div>
-                  <div class="nps-section-meta">대상: <span class="nps-active-character">none</span></div>
+                  <div class="nps-section-meta">대상: <span class="nps-active-character">없음</span></div>
                 </section>
-                <section class="nps-section">
+                <section class="nps-section nps-flow-section" data-step="1">
                   <div class="nps-section-head">
                     <div>
-                      <div class="nps-section-title">Group Definition</div>
-                      <div class="nps-section-meta">[Group] 아래에 프롬프트를 한 줄씩 입력</div>
+                      <div class="nps-section-title">그룹 정의</div>
+                      <div class="nps-section-meta">[그룹] 아래에 프롬프트를 한 줄씩 입력합니다</div>
                     </div>
-                    <button class="nps-sample" type="button">Sample</button>
                   </div>
                   <div class="nps-editor-shell">
                     <div class="nps-editor-line-numbers" aria-hidden="true">1</div>
@@ -4522,44 +6451,44 @@
                     <div class="nps-editor-line-measurer" aria-hidden="true"></div>
                   </div>
                 </section>
-                <section class="nps-section">
+                <section class="nps-section nps-flow-section" data-step="2">
                   <div class="nps-section-head">
                     <div>
-                      <div class="nps-section-title">선행 프롬프트</div>
-                      <div class="nps-section-meta nps-summary">0 group(s)</div>
+                      <div class="nps-section-title nps-leading-title">선행 칩</div>
+                      <div class="nps-section-meta nps-summary">0개 그룹</div>
                     </div>
-                    <button class="nps-clear-all" type="button">Clear All</button>
+                    <button class="nps-clear-all" type="button">전체 해제</button>
                   </div>
                   <div class="nps-groups"></div>
                 </section>
-                <section class="nps-section">
+                <section class="nps-section nps-flow-section" data-step="3">
                   <div class="nps-section-head">
                     <div>
-                      <div class="nps-section-title">Quick Prompt</div>
-                      <div class="nps-section-meta">선행 뒤, 후행 앞에 병합됩니다</div>
+                      <div class="nps-section-title">빠른 프롬프트</div>
+                      <div class="nps-section-meta nps-quick-meta">선행 칩과 후행 칩 사이에 병합됩니다</div>
                     </div>
                   </div>
-                  <textarea class="nps-quick" spellcheck="false" placeholder="Write prompt text here"></textarea>
+                  <textarea class="nps-quick" spellcheck="false" placeholder="프롬프트를 입력하세요"></textarea>
                 </section>
-                <section class="nps-section nps-suffix-section" hidden>
+                <section class="nps-section nps-flow-section nps-suffix-section" data-step="4" hidden>
                   <div class="nps-section-head">
                     <div>
-                      <div class="nps-section-title">후행 프롬프트</div>
-                      <div class="nps-section-meta nps-suffix-summary">0 group(s)</div>
+                      <div class="nps-section-title">후행 칩</div>
+                      <div class="nps-section-meta nps-suffix-summary">0개 그룹</div>
                     </div>
-                    <button class="nps-suffix-clear-all" type="button">Clear All</button>
+                    <button class="nps-suffix-clear-all" type="button">전체 해제</button>
                   </div>
                   <div class="nps-suffix-groups"></div>
                 </section>
-                <section class="nps-section">
+                <section class="nps-section nps-flow-section" data-step="5">
                   <div class="nps-section-head">
                     <div>
-                      <div class="nps-section-title">Preview</div>
-                      <div class="nps-section-meta nps-prompt-meta">empty</div>
+                      <div class="nps-section-title">미리보기</div>
+                      <div class="nps-section-meta nps-prompt-meta">비어 있음</div>
                     </div>
-                    <button class="nps-copy" type="button" disabled>Copy</button>
+                    <button class="nps-copy" type="button" disabled>복사</button>
                   </div>
-                  <pre class="nps-preview is-empty">No prompt selected.</pre>
+                  <pre class="nps-preview is-empty">선택된 프롬프트가 없습니다.</pre>
                 </section>
               </section>
             </div>
@@ -4572,11 +6501,17 @@
     ui = {
       shell: panelShadow.querySelector(".nps-shell"),
       collapsedCard: panelShadow.querySelector(".nps-collapsed-card"),
+      collapsedOpenButton: panelShadow.querySelector(".nps-collapsed-open"),
       collapsedCount: panelShadow.querySelector(".nps-collapsed-count"),
+      collapsedControls: panelShadow.querySelector(".nps-collapsed-controls"),
+      collapsedCountInput: panelShadow.querySelector(".nps-collapsed-count-input"),
+      collapsedIntervalInput: panelShadow.querySelector(".nps-collapsed-interval-input"),
+      collapsedCountPresetButtons: Array.from(panelShadow.querySelectorAll(".nps-collapsed-presets button")),
       collapsedAutoButton: panelShadow.querySelector(".nps-collapsed-auto"),
       collapseButton: panelShadow.querySelector(".nps-collapse"),
       sidebarAutoTab: panelShadow.querySelector(".nps-sidebar-auto"),
       sidebarMainTab: panelShadow.querySelector(".nps-sidebar-main"),
+      sidebarNegativeTab: panelShadow.querySelector(".nps-sidebar-negative"),
       characterTabList: panelShadow.querySelector(".nps-character-tabs"),
       autoView: panelShadow.querySelector(".nps-auto-view"),
       editorView: panelShadow.querySelector(".nps-editor-view"),
@@ -4594,7 +6529,9 @@
       editorLineNumbers: panelShadow.querySelector(".nps-editor-line-numbers"),
       editorLineMeasurer: panelShadow.querySelector(".nps-editor-line-measurer"),
       quickInput: panelShadow.querySelector(".nps-quick"),
+      quickMeta: panelShadow.querySelector(".nps-quick-meta"),
       groupList: panelShadow.querySelector(".nps-groups"),
+      leadingTitle: panelShadow.querySelector(".nps-leading-title"),
       suffixSection: panelShadow.querySelector(".nps-suffix-section"),
       suffixGroupList: panelShadow.querySelector(".nps-suffix-groups"),
       summary: panelShadow.querySelector(".nps-summary"),
@@ -4607,6 +6544,14 @@
       applyAllButton: panelShadow.querySelector(".nps-apply-all"),
       generateButton: panelShadow.querySelector(".nps-generate"),
       autoButton: panelShadow.querySelector(".nps-auto"),
+      exportButton: panelShadow.querySelector(".nps-export"),
+      importButton: panelShadow.querySelector(".nps-import"),
+      importFileInput: panelShadow.querySelector(".nps-import-file"),
+      restoreButton: panelShadow.querySelector(".nps-restore"),
+      autoSaveToggle: panelShadow.querySelector(".nps-auto-save-toggle"),
+      autoVolumeSlider: panelShadow.querySelector(".nps-volume-slider"),
+      autoVolumeValue: panelShadow.querySelector(".nps-volume-value"),
+      autoNotificationToggle: panelShadow.querySelector(".nps-auto-notification-toggle"),
       clearAllButton: panelShadow.querySelector(".nps-clear-all"),
       suffixClearAllButton: panelShadow.querySelector(".nps-suffix-clear-all"),
       sampleButton: panelShadow.querySelector(".nps-sample"),
@@ -4635,6 +6580,12 @@
     if (!ui.status) {
       return;
     }
+    if (pendingStorageNotice) {
+      const notice = pendingStorageNotice;
+      pendingStorageNotice = null;
+      setStatus(notice, "warn");
+      return;
+    }
     const scan = scanNovelAiPromptSlots();
     renderSlotButtons();
     const generateButton = findGenerateButton();
@@ -4642,9 +6593,13 @@
     if (warning) {
       setStatus(warning, "warn");
     } else if (!generateButton) {
-      setStatus("Generate 버튼을 기다리는 중입니다.", "warn");
+      setStatus("생성 버튼을 기다리는 중입니다.", "warn");
     } else if (!scan.main.root) {
-      setStatus("Base Prompt 입력 영역을 기다리는 중입니다.", "warn");
+      setStatus("메인 프롬프트 입력 영역을 기다리는 중입니다.", "warn");
+    } else if (pendingPromptApply) {
+      setStatus("프롬프트 적용 완료를 기다리는 중입니다.", "ok");
+    } else if (autoRun.waitingForExistingGeneration) {
+      setStatus("현재 생성 완료를 기다린 뒤 자동 생성을 시작합니다.", "ok");
     } else if (autoRun.active) {
       setStatus(`자동 생성 진행 중: 완료 ${autoRun.completedCount} / ${formatAutoTarget(autoRun.target)}`, "ok");
     } else {
@@ -4663,15 +6618,29 @@
     if (areaName !== "sync") {
       return;
     }
-    if (changes.intervalTime && ui.intervalInput && !autoRun.active) {
-      ui.intervalInput.value = changes.intervalTime.newValue ?? "";
-    }
-    if (changes.gcount && ui.countInput && !autoRun.active) {
-      ui.countInput.value = changes.gcount.newValue ?? "";
+    if (!ui) {
+      return;
     }
     if (changes.intervalTime || changes.gcount) {
+      if (!autoRun.active) {
+        setAutoTimingInputs({
+          intervalTime: changes.intervalTime?.newValue ?? ui.intervalInput?.value ?? 3,
+          gcount: changes.gcount?.newValue ?? ui.countInput?.value ?? "",
+        });
+      }
       renderAutoRunControls();
     }
+    const preferenceUpdates = {};
+    if (changes.autoSaveEnabled) {
+      preferenceUpdates.autoSaveEnabled = changes.autoSaveEnabled.newValue;
+    }
+    if (changes.volume) {
+      preferenceUpdates.volume = changes.volume.newValue;
+    }
+    if (changes.autoCompletionNotificationEnabled) {
+      preferenceUpdates.autoCompletionNotificationEnabled = changes.autoCompletionNotificationEnabled.newValue;
+    }
+    setAutoPreferenceInputs(preferenceUpdates);
   });
 
   chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
@@ -4741,21 +6710,93 @@
     }
   }, true);
 
-  document.addEventListener("keydown", (event) => {
-    if (event.ctrlKey && event.key === "Enter") {
-      event.preventDefault();
-      event.stopPropagation();
-      void startAutoGenerate({ useSelector: false });
+  function isShortcutEnter(event) {
+    return event.key === "Enter" && !event.shiftKey && !event.metaKey;
+  }
+
+  function isCtrlEnterShortcut(event) {
+    return event.ctrlKey && !event.altKey && isShortcutEnter(event);
+  }
+
+  function isCtrlAltEnterShortcut(event) {
+    return event.ctrlKey && event.altKey && isShortcutEnter(event);
+  }
+
+  function isShortcutSpace(event) {
+    return event.code === "Space" || event.key === " " || event.key === "Spacebar";
+  }
+
+  function isCtrlSpaceShortcut(event) {
+    return event.ctrlKey
+      && !event.altKey
+      && !event.shiftKey
+      && !event.metaKey
+      && isShortcutSpace(event);
+  }
+
+  function isCtrlShiftSpaceShortcut(event) {
+    return event.ctrlKey
+      && !event.altKey
+      && event.shiftKey
+      && !event.metaKey
+      && isShortcutSpace(event);
+  }
+
+  function isCtrlBackquoteShortcut(event) {
+    return event.ctrlKey
+      && !event.altKey
+      && !event.shiftKey
+      && !event.metaKey
+      && (event.code === "Backquote" || event.key === "`");
+  }
+
+  function consumeGlobalShortcut(event) {
+    event.preventDefault();
+    event.stopPropagation();
+    event.stopImmediatePropagation();
+  }
+
+  function captureGlobalShortcut(event) {
+    if (isCtrlShiftSpaceShortcut(event)) {
+      consumeGlobalShortcut(event);
+      if (!event.repeat) {
+        void applyAllSlotsToNovelAi();
+      }
+      return;
     }
-    if (event.ctrlKey && event.shiftKey && event.code === "KeyX") {
-      event.preventDefault();
-      event.stopPropagation();
+
+    if (isCtrlSpaceShortcut(event)) {
+      consumeGlobalShortcut(event);
+      if (!event.repeat) {
+        void applyActiveSlotToNovelAi();
+      }
+      return;
+    }
+
+    if (isCtrlAltEnterShortcut(event)) {
+      consumeGlobalShortcut(event);
       void stopAutoGenerate({ playAudio: true });
+      return;
     }
-  }, true);
+
+    if (isCtrlEnterShortcut(event)) {
+      consumeGlobalShortcut(event);
+      void startAutoGenerate({ useSelector: false });
+      return;
+    }
+
+    if (isCtrlBackquoteShortcut(event)) {
+      consumeGlobalShortcut(event);
+      ensurePanel();
+      setPanelCollapsed(!selectorState.panelCollapsed);
+    }
+  }
+
+  window.addEventListener("keydown", captureGlobalShortcut, true);
 
   window.addEventListener("beforeunload", () => {
     clearAutoTimers();
+    cancelAutoHistoryHighlightWait();
     if (statusTimer) {
       clearInterval(statusTimer);
       statusTimer = null;

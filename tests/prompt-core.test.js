@@ -3,6 +3,12 @@
 const assert = require("node:assert/strict");
 const Core = require("../prompt-core");
 
+assert.equal(Core.DEFAULT_GROUPS_DEFINITION, Core.DEFAULT_MAIN_GROUPS_DEFINITION);
+assert.match(Core.DEFAULT_GROUPS_DEFINITION, /\[Style\]/);
+assert.match(Core.DEFAULT_NEGATIVE_GROUPS_DEFINITION, /\[Negatives\]/);
+assert.equal(Core.DEFAULT_CHARACTER_LABEL, "샘플");
+assert.match(Core.DEFAULT_CHARACTER_PROMPT_GROUPS_DEFINITION, /\[Appearance\]/);
+
 assert.equal(Core.formatPromptItemWithWeight("1girl", 1), "1girl");
 assert.equal(Core.formatPromptItemWithWeight("1girl", 1.5), "1.5::1girl::");
 assert.equal(Core.formatPromptItemWithWeight("1girl", -1.5), "-1.5::1girl::");
@@ -15,6 +21,10 @@ assert.equal(Core.normalizePromptWeight(9), 3);
 assert.equal(Core.normalizePromptWeight(-9), -3);
 assert.equal(Core.normalizePromptWeight(0.01), 0);
 assert.equal(Core.normalizePromptWeight(-0.01), 0);
+assert.equal(Core.getNextCharacterLabel(["Char 1", "Char 2"]), "Char 3");
+assert.equal(Core.getNextCharacterLabel(["Char 1", "Char 3"]), "Char 2");
+assert.equal(Core.getNextCharacterLabel(["Hero", "Sidekick"]), "Char 1");
+assert.equal(Core.getNextCharacterLabel([" char   1 ", "CHAR 2"]), "Char 3");
 
 const groups = Core.parseGroupsDefinition(`[Personnel]
 1girl

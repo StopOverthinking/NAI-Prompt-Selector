@@ -1,32 +1,42 @@
 (function attachPromptCore(global) {
   "use strict";
 
-  const DEFAULT_GROUPS_DEFINITION = `[Quality]
-newest, year2024, masterpiece, best quality, amazing quality, highres, absurdres, high quality
-
-[Artist]
-@add_artist
-
-[Personnel]
-1girl
-2girls
-1boy
-2boys
-solo
-solo focus
-couple
+  const DEFAULT_MAIN_GROUPS_DEFINITION = `[Style]
+artist: (아티스트 입력)
 
 [Background]
-location, indoors, classroom
-location, outdoors, forest
-simple background, colored background
+location
+indoors
+outdoors
+blurry background
+simple background
 
-[Character 1]
-black hair, short hair, bob cut, center-flap bangs
-black eyes, tareme
-denim jacket, collared jacket, black t-shirt
-white shorts
-white kneehighs, white sneakers`;
+[Quality]
+-3::artist collaboration ::, anime coloring, pastel colors, detailed shading, expert shading, best illustration, -1::multiple views ::, 2::Masterpiece, best quality, amazing quality, highres, absurdres ::, no text, -2::upscaled::, -1::flat color::, -1::border::, -1::greyscale character::, very aesthetic, masterpiece, no text, -2::blurry::`;
+  const DEFAULT_NEGATIVE_GROUPS_DEFINITION = `[Negatives]
+blurry, lowres, error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, very displeasing, chromatic aberration, too many watermarks, {{worst quality, bad quality}}, bad pupils, bad glabella, {{{{bad hands}}}}, {{{bad eyes}}}, {{{{{displeasing, very displeasing}}}}}, {{{{{bad anatomy, bad hands, missing finger, bad face, duplicate, mutation, deformed, disfigured, extra arms, extra legs, long neck, bad feet, bad proportions, missing}}}}}, {{{undetailed eyes}}}, bb (baalbuddy), bkub, gaoo (frpjx283), milkpanda, nameo (judgemasterkou), yuno385, multiple views`;
+  const DEFAULT_CHARACTER_LABEL = "샘플";
+  const DEFAULT_CHARACTER_PROMPT_GROUPS_DEFINITION = `[Appearance]
+girl
+large breasts
+curvy
+black hair
+long hair
+blunt bangs
+tareme
+freckles
+thick thighs
+wavy mouth
+
+[Upper Attire]
+oversized jacket
+black track jacket
+
+[Lower Attire]
+tight pants
+black gym shorts
+skindentation`;
+  const DEFAULT_GROUPS_DEFINITION = DEFAULT_MAIN_GROUPS_DEFINITION;
 
   const DEFAULT_PROMPT_WEIGHT = 1.0;
   const MIN_PROMPT_WEIGHT = -3.0;
@@ -82,6 +92,26 @@ white kneehighs, white sneakers`;
 
   function normalizePromptIdentity(value) {
     return unwrapNovelAiWeightSyntax(value).toLowerCase();
+  }
+
+  function getNextCharacterLabel(existingLabels = []) {
+    const usedNumbers = new Set();
+    for (const label of Array.isArray(existingLabels) ? existingLabels : []) {
+      const match = String(label || "").trim().match(/^char\s+(\d+)$/i);
+      if (!match) {
+        continue;
+      }
+      const labelNumber = Number.parseInt(match[1], 10);
+      if (Number.isFinite(labelNumber) && labelNumber > 0) {
+        usedNumbers.add(labelNumber);
+      }
+    }
+
+    let nextNumber = 1;
+    while (usedNumbers.has(nextNumber)) {
+      nextNumber += 1;
+    }
+    return `Char ${nextNumber}`;
   }
 
   function normalizeQuickPrompt(value) {
@@ -371,7 +401,11 @@ white kneehighs, white sneakers`;
   }
 
   const api = {
+    DEFAULT_CHARACTER_LABEL,
+    DEFAULT_CHARACTER_PROMPT_GROUPS_DEFINITION,
     DEFAULT_GROUPS_DEFINITION,
+    DEFAULT_MAIN_GROUPS_DEFINITION,
+    DEFAULT_NEGATIVE_GROUPS_DEFINITION,
     DEFAULT_PROMPT_WEIGHT,
     MIN_PROMPT_WEIGHT,
     MAX_PROMPT_WEIGHT,
@@ -382,6 +416,7 @@ white kneehighs, white sneakers`;
     formatPromptItemWithWeight,
     formatPromptWeightLabel,
     formatPromptWeightValue,
+    getNextCharacterLabel,
     getRememberedPromptWeight,
     hasQuickPromptContent,
     mergeQuickPrompts,

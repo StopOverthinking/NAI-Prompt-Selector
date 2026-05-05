@@ -62,9 +62,9 @@ async function refreshPageState() {
   updateAutoButtons(Boolean(response.autoActive || autoClickEnabled));
 
   if (!response.hasGenerateButton) {
-    setStatus("Generate 버튼을 기다리는 중입니다.", "warn");
+    setStatus("생성 버튼을 기다리는 중입니다.", "warn");
   } else if (!response.promptEditorCount) {
-    setStatus("Base Prompt 입력 영역을 기다리는 중입니다.", "warn");
+    setStatus("메인 프롬프트 입력 영역을 기다리는 중입니다.", "warn");
   } else {
     setStatus("NovelAI 페이지와 연결되었습니다.", "ok");
   }

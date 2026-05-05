@@ -34,7 +34,7 @@ function sendMessageToActiveNovelAiTab(request, sendResponse) {
       }
 
       chrome.scripting.insertCSS({ target: { tabId: tab.id }, files: ["content.css"] }, () => {
-        chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["prompt-core.js", "content.js"] }, () => {
+        chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["prompt-core.js", "prompt-storage.js", "content.js"] }, () => {
           if (chrome.runtime.lastError) {
             sendResponse({ ok: false, error: chrome.runtime.lastError.message });
             return;
@@ -57,15 +57,23 @@ function createCompletionNotification(count) {
     ? `총 ${count}장의 이미지 생성이 완료되었습니다.`
     : "설정된 자동 생성 작업이 완료되었습니다.";
 
-  chrome.notifications.create(`nai-prompt-selector-complete-${Date.now()}`, {
-    type: "basic",
-    iconUrl: chrome.runtime.getURL("icons/icon48.png"),
-    title: "자동 생성 완료",
-    message,
-    priority: 0,
-    requireInteraction: false,
-  });
+  chrome.storage.sync.get(["autoCompletionNotificationEnabled"], (result = {}) => {
+    if (result.autoCompletionNotificationEnabled !== false) {
+      chrome.notifications.create(`nai-prompt-selector-complete-${Date.now()}`, {
+        type: "basic",
+        iconUrl: chrome.runtime.getURL("icons/icon48.png"),
+        title: "자동 생성 완료",
+        message,
+        priority: 0,
+        requireInteraction: false,
+      });
+    }
 
+    resetPopupButtons();
+  });
+}
+
+function resetPopupButtons() {
   chrome.runtime.sendMessage({ action: "resetPopupButtons" }, () => {
     void chrome.runtime.lastError;
   });
@@ -84,9 +92,7 @@ chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
   }
 
   if (request?.action === "resetPopupButtons") {
-    chrome.runtime.sendMessage({ action: "resetPopupButtons" }, () => {
-      void chrome.runtime.lastError;
-    });
+    resetPopupButtons();
     sendResponse({ ok: true });
     return false;
   }

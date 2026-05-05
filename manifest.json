@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
   "name": "NAI-Prompt-Selector",
-  "version": "0.1.0",
+  "version": "0.2.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6NbyffcLnh85nBHwVitiVOtxh4wTRdlU6eHkOeqpEcNmTGkQ3EdeChQec20zdXWrY2jk/HXFUANhSEZpLUetuxmiItdEB7WNXS7JZMSlJvvDyQ/r89bwnvzLTMfTcpMoWVJ1ZX9dy43WxQSV8mTxmINqmB9dtv2c8MGF8Hg7ZgKnncPgZRLumbDMmYOUox/3HrM9BWL+Oxh0nwcNBA2zEK5DpxYSK1fj+rnfBSnCiJRwOKVgF4bItegFRWTuGYvREHxznxrU3mCV94wbtMDlku2OWh/qKru8I6vVx5/ouiSmqMYLcGY39iZwgO2EZ2dElzgZyVjOKwyPrJNuA8QwfwIDAQAB",
   "description": "Prompt selector, auto generation, completion notifications, and recent image highlights for NovelAI Image.",
   "permissions": [
     "activeTab",
@@ -14,7 +15,13 @@
     "https://novelai.net/*"
   ],
   "action": {
-    "default_popup": "popup/popup.html"
+    "default_popup": "popup/popup.html",
+    "default_icon": {
+      "16": "icons/icon16.png",
+      "32": "icons/icon32.png",
+      "48": "icons/icon48.png",
+      "128": "icons/icon128.png"
+    }
   },
   "background": {
     "service_worker": "background.js"
@@ -26,6 +33,7 @@
       ],
       "js": [
         "prompt-core.js",
+        "prompt-storage.js",
         "content.js"
       ],
       "css": [
