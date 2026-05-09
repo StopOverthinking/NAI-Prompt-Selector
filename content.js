@@ -3386,20 +3386,48 @@
     return panelTab?.kind === "character" ? panelTab.index : null;
   }
 
+  function hasStoredCharacterSlot(index) {
+    const numericIndex = Number.parseInt(index, 10);
+    if (!Number.isFinite(numericIndex) || numericIndex < 1) {
+      return false;
+    }
+    return Boolean(
+      selectorState.slots[makeCharacterSlotId(numericIndex, "prompt")]
+      || selectorState.slots[makeCharacterSlotId(numericIndex, "uc")]
+    );
+  }
+
+  function canKeepCharacterPanelTab(index, indices = getCurrentCharacterIndices()) {
+    const numericIndex = Number.parseInt(index, 10);
+    if (!Number.isFinite(numericIndex) || numericIndex < 1) {
+      return false;
+    }
+    return indices.includes(numericIndex) || (!indices.length && hasStoredCharacterSlot(numericIndex));
+  }
+
   function getValidPanelTab(indices = getCurrentCharacterIndices()) {
     const panelTab = parsePanelTab(selectorState.activePanelTab);
     if (!panelTab) {
       return "auto";
     }
+
+    const activeSlot = parseSlotId(getActiveSlotId());
+    if (
+      panelTab.kind === "main"
+      && activeSlot?.scope === "character"
+      && canKeepCharacterPanelTab(activeSlot.index, indices)
+    ) {
+      return getCharacterPanelTabId(activeSlot.index);
+    }
+
     if (panelTab.kind !== "character") {
       return selectorState.activePanelTab;
     }
-    if (indices.includes(panelTab.index)) {
+    if (canKeepCharacterPanelTab(panelTab.index, indices)) {
       return selectorState.activePanelTab;
     }
 
-    const activeSlot = parseSlotId(getActiveSlotId());
-    if (activeSlot?.scope === "character" && indices.includes(activeSlot.index)) {
+    if (activeSlot?.scope === "character" && canKeepCharacterPanelTab(activeSlot.index, indices)) {
       return getCharacterPanelTabId(activeSlot.index);
     }
     return indices.length ? getCharacterPanelTabId(indices[0]) : "main";
@@ -3665,14 +3693,14 @@
       const activeSlot = parseSlotId(getActiveSlotId());
       ui.sidebarMainTab.classList.toggle(
         "is-active",
-        selectorState.activePanelTab === "main" && activeSlot?.kind !== "uc",
+        selectorState.activePanelTab === "main" && activeSlot?.scope === "main" && activeSlot.kind !== "uc",
       );
     }
     if (ui.sidebarNegativeTab) {
       const activeSlot = parseSlotId(getActiveSlotId());
       ui.sidebarNegativeTab.classList.toggle(
         "is-active",
-        selectorState.activePanelTab === "main" && activeSlot?.kind === "uc",
+        selectorState.activePanelTab === "main" && activeSlot?.scope === "main" && activeSlot.kind === "uc",
       );
     }
 

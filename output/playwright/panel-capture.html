@@ -1,0 +1,284 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>NAI-Prompt-Selector Panel Capture</title>
+    <style>
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: #0b1018;
+        color: #e9f1f5;
+        font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+      }
+      .mock-page {
+        min-height: 100vh;
+        padding: 28px 380px 28px 28px;
+        background:
+          radial-gradient(circle at 28% 16%, rgba(45, 107, 127, 0.22), transparent 34%),
+          linear-gradient(135deg, #0d1420 0%, #15121f 48%, #081015 100%);
+      }
+      .mock-topbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 20px;
+        padding: 14px 16px;
+        border: 1px solid rgba(132, 151, 167, 0.18);
+        border-radius: 10px;
+        background: rgba(15, 22, 33, 0.9);
+      }
+      .mock-brand {
+        font-size: 18px;
+        font-weight: 760;
+      }
+      .mock-pill {
+        padding: 7px 10px;
+        border: 1px solid rgba(53, 205, 226, 0.34);
+        border-radius: 999px;
+        color: #9ceff7;
+        font-size: 12px;
+      }
+      .mock-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) 280px;
+        gap: 18px;
+      }
+      .mock-card {
+        border: 1px solid rgba(132, 151, 167, 0.18);
+        border-radius: 12px;
+        background: rgba(13, 20, 31, 0.82);
+        box-shadow: 0 20px 50px rgba(0, 0, 0, 0.24);
+      }
+      .mock-card h2,
+      .mock-card h3 {
+        margin: 0;
+        padding: 14px 16px 6px;
+        font-size: 15px;
+      }
+      .image-gen-prompt-main,
+      .character-prompt-input {
+        padding: 12px 16px 16px;
+      }
+      .mock-tabs {
+        display: flex;
+        gap: 8px;
+        margin-bottom: 10px;
+      }
+      .mock-tabs button,
+      .mock-generate,
+      .mock-add {
+        border: 1px solid rgba(132, 151, 167, 0.28);
+        border-radius: 7px;
+        background: rgba(18, 26, 37, 0.95);
+        color: #edf3f7;
+        padding: 8px 11px;
+        font-weight: 700;
+      }
+      .mock-tabs button:first-child {
+        border-color: rgba(53, 205, 226, 0.48);
+        color: #aef6ff;
+      }
+      .prompt-input-box-base-prompt,
+      .prompt-input-box-prompt,
+      .prompt-input-box-undesired-content {
+        margin-bottom: 10px;
+      }
+      [contenteditable] {
+        min-height: 54px;
+        padding: 10px;
+        border: 1px solid rgba(132, 151, 167, 0.24);
+        border-radius: 8px;
+        background: #080e16;
+        color: #d9e7ed;
+        outline: none;
+      }
+      .mock-side {
+        display: flex;
+        flex-direction: column;
+        gap: 12px;
+      }
+      .mock-preview {
+        aspect-ratio: 1;
+        border-radius: 12px;
+        background:
+          linear-gradient(145deg, rgba(79, 161, 179, 0.36), rgba(43, 32, 72, 0.32)),
+          repeating-linear-gradient(45deg, rgba(255,255,255,0.04) 0 12px, transparent 12px 24px);
+      }
+      #historyContainer {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 8px;
+        padding: 12px;
+      }
+      #historyContainer [role="button"] {
+        aspect-ratio: 1;
+        border-radius: 8px;
+        background: linear-gradient(135deg, #283342, #4b334d);
+      }
+    </style>
+  </head>
+  <body>
+    <main class="mock-page">
+      <div class="mock-topbar">
+        <div class="mock-brand">NovelAI Image</div>
+        <div class="mock-pill">https://novelai.net/image</div>
+      </div>
+      <div class="mock-grid">
+        <section class="mock-card">
+          <h2>Prompt</h2>
+          <div class="image-gen-prompt-main">
+            <div class="mock-tabs">
+              <button type="button">Prompt</button>
+              <button type="button">Undesired Content</button>
+            </div>
+            <div class="prompt-input-box-base-prompt">
+              <div contenteditable="true"><p>best quality, 1girl, black hair</p></div>
+            </div>
+            <div class="prompt-input-box-undesired-content">
+              <div contenteditable="true"><p>lowres, blurry, bad anatomy</p></div>
+            </div>
+          </div>
+          <div class="character-prompt-input character-prompt-input-1">
+            <div>
+              <strong>Character 1</strong>
+              <button type="button" aria-label="Move up"></button>
+              <button type="button" aria-label="Move down"></button>
+              <button type="button" aria-pressed="true" title="Disable Character"></button>
+            </div>
+            <div>
+              <div class="mock-tabs">
+                <button type="button">Prompt</button>
+                <button type="button">Undesired Content</button>
+                <button type="button" title="Delete"></button>
+              </div>
+              <div class="prompt-input-box-prompt">
+                <div contenteditable="true"><p>black hair, long hair, glasses</p></div>
+              </div>
+            </div>
+          </div>
+          <button class="mock-add" type="button">Add Character</button>
+        </section>
+        <aside class="mock-side">
+          <div class="mock-card">
+            <h3>Current Image</h3>
+            <div class="mock-preview"></div>
+          </div>
+          <button class="mock-generate" type="button">Generate 1 Image <span>0 Anlas</span></button>
+          <div class="mock-card">
+            <h3>History</h3>
+            <div id="historyContainer">
+              <div role="button" draggable="true"></div>
+              <div role="button" draggable="true"></div>
+              <div role="button" draggable="true"></div>
+            </div>
+          </div>
+        </aside>
+      </div>
+    </main>
+
+    <script>
+      (() => {
+        const localStore = {
+          "naiPromptSelector.selector": {
+            panelCollapsed: true,
+            activePanelTab: "main",
+            activeSlotId: "main.base",
+            characterLabels: { "1": "Char 1" },
+            slots: {}
+          },
+          "naiPromptSelector.selectorBackups": [],
+          "naiPromptSelector.selectorLastGood": null
+        };
+        const syncStore = {
+          intervalTime: 3,
+          gcount: 20,
+          autoSaveEnabled: true,
+          volume: 0.5
+        };
+        const makeArea = (store) => ({
+          get(keys, callback) {
+            const result = {};
+            const list = Array.isArray(keys) ? keys : Object.keys(store);
+            if (typeof keys === "string") {
+              result[keys] = store[keys];
+            } else if (Array.isArray(keys)) {
+              list.forEach((key) => { result[key] = store[key]; });
+            } else if (keys && typeof keys === "object") {
+              Object.keys(keys).forEach((key) => { result[key] = store[key] ?? keys[key]; });
+            } else {
+              Object.assign(result, store);
+            }
+            setTimeout(() => callback(result), 0);
+          },
+          set(values, callback) {
+            Object.assign(store, values || {});
+            setTimeout(() => callback && callback(), 0);
+          }
+        });
+        window.chrome = {
+          runtime: {
+            id: "local-capture",
+            lastError: null,
+            getURL: (path) => `../../${path}`,
+            sendMessage: (message, callback) => setTimeout(() => callback && callback({ ok: true }), 0),
+            onMessage: { addListener() {} }
+          },
+          storage: {
+            local: makeArea(localStore),
+            sync: makeArea(syncStore),
+            onChanged: { addListener() {} }
+          }
+        };
+      })();
+    </script>
+    <script src="../../prompt-core.js"></script>
+    <script src="../../prompt-storage.js"></script>
+    <script src="../../content.js"></script>
+    <script>
+      (() => {
+        const mode = new URLSearchParams(location.search).get("mode") || "editor";
+        const ready = () => {
+          const host = document.querySelector("#nai-prompt-selector-host");
+          const root = host && host.shadowRoot;
+          if (!root) {
+            setTimeout(ready, 50);
+            return;
+          }
+          if (mode !== "collapsed") {
+            window.dispatchEvent(new KeyboardEvent("keydown", {
+              key: "`",
+              code: "Backquote",
+              ctrlKey: true,
+              bubbles: true,
+              cancelable: true
+            }));
+          }
+          setTimeout(() => {
+            if (mode !== "collapsed") {
+              host.style.right = "auto";
+              host.style.left = `${Math.max(16, window.innerWidth - 744)}px`;
+              host.style.width = "704px";
+              const shell = root.querySelector(".nps-shell");
+              if (shell) shell.dataset.collapsed = "false";
+            }
+            if (mode === "auto") {
+              root.querySelector(".nps-sidebar-auto")?.click();
+            }
+            if (mode === "more") {
+              const details = root.querySelector(".nps-more-menu");
+              if (details) details.open = true;
+            }
+            if (mode === "character") {
+              root.querySelector(".nps-character-tab")?.click();
+            }
+            window.__captureReady = true;
+          }, 250);
+        };
+        ready();
+      })();
+    </script>
+  </body>
+</html>
