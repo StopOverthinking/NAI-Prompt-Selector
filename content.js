@@ -29,6 +29,11 @@
   const PROMPT_APPLY_FLUSH_MS = 180;
   const PANEL_POSITION_MARGIN = 8;
   const PANEL_EDGE_ANCHOR_DISTANCE = 24;
+  const EDITOR_HEIGHT_SAVE_DELAY_MS = 250;
+  const MIN_EDITOR_HEIGHT_PX = 48;
+  const MAX_EDITOR_HEIGHT_PX = 2000;
+  const EDITOR_RESIZE_CLICK_SUPPRESS_MS = 450;
+  const EDITOR_RESIZE_HEIGHT_THRESHOLD_PX = 1;
   const HISTORY_ITEM_SELECTOR = 'div[role="button"][draggable="true"]';
   const ENHANCE_SOURCE_REAPPLY_DELAYS_MS = [0, 300, 1000];
   const ENHANCE_SOURCE_OBSERVE_MS = 2000;
@@ -44,7 +49,7 @@
   const MAIN_UC_SLOT_ID = "main.uc";
 
   const DEFAULT_SELECTOR_STATE = {
-    version: 5,
+    version: 6,
     activeSlotId: MAIN_BASE_SLOT_ID,
     activeCharacterIndex: null,
     activePanelTab: "auto",
@@ -52,6 +57,10 @@
     panelPosition: null,
     panelCollapsedPosition: null,
     panelCollapsedFrame: null,
+    editorHeights: {
+      groupsDefinition: null,
+      quickPrompt: null,
+    },
     characterLabels: {},
     slots: {},
   };
@@ -107,6 +116,9 @@
   let panelViewportRealignRequestId = 0;
   let panelCurrentFrame = null;
   let panelResolutionWatcher = null;
+  let editorHeightSaveTimer = null;
+  let editorResizeInteraction = null;
+  let suppressEditorResizeClickUntil = 0;
 
   function delay(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
@@ -373,6 +385,22 @@
     };
   }
 
+  function sanitizeEditorHeight(value) {
+    const height = Number.parseFloat(value);
+    if (!Number.isFinite(height) || height < MIN_EDITOR_HEIGHT_PX || height > MAX_EDITOR_HEIGHT_PX) {
+      return null;
+    }
+    return Math.round(height);
+  }
+
+  function sanitizeEditorHeights(value = {}) {
+    const source = value && typeof value === "object" && !Array.isArray(value) ? value : {};
+    return {
+      groupsDefinition: sanitizeEditorHeight(source.groupsDefinition),
+      quickPrompt: sanitizeEditorHeight(source.quickPrompt),
+    };
+  }
+
   function sanitizeCharacterLabels(value) {
     const labels = {};
     if (!value || typeof value !== "object" || Array.isArray(value)) {
@@ -426,6 +454,7 @@
       panelPosition: storedPanelPosition,
       panelCollapsedPosition: storedPanelCollapsedPosition || (storedPanelCollapsed ? storedPanelPosition : null),
       panelCollapsedFrame: storedPanelCollapsedFrame,
+      editorHeights: sanitizeEditorHeights(stored.editorHeights),
       activePanelTab: sanitizePanelTab(stored.activePanelTab),
       characterLabels: sanitizeCharacterLabels(stored.characterLabels),
       activeSlotId: typeof stored.activeSlotId === "string" ? stored.activeSlotId : MAIN_BASE_SLOT_ID,
@@ -3262,6 +3291,148 @@
     syncEditorLineNumbersScroll();
   }
 
+  function getPanelBodyScrollTop() {
+    return Number.parseFloat(ui.body?.scrollTop) || 0;
+  }
+
+  function restorePanelBodyScrollTop(scrollTop) {
+    if (!ui.body) {
+      return;
+    }
+    ui.body.scrollTop = Math.max(0, Number.parseFloat(scrollTop) || 0);
+  }
+
+  function preservePanelBodyScroll(callback) {
+    const scrollTop = getPanelBodyScrollTop();
+    callback();
+    restorePanelBodyScrollTop(scrollTop);
+    requestAnimationFrame(() => restorePanelBodyScrollTop(scrollTop));
+  }
+
+  function setResizableEditorHeight(element, height) {
+    if (!element) {
+      return;
+    }
+    const normalizedHeight = sanitizeEditorHeight(height);
+    if (normalizedHeight) {
+      element.style.height = `${normalizedHeight}px`;
+    } else {
+      element.style.removeProperty("height");
+    }
+  }
+
+  function applyEditorHeightsFromState() {
+    const heights = sanitizeEditorHeights(selectorState.editorHeights);
+    selectorState.editorHeights = heights;
+    preservePanelBodyScroll(() => {
+      setResizableEditorHeight(ui.editorShell, heights.groupsDefinition);
+      setResizableEditorHeight(ui.quickInput, heights.quickPrompt);
+      renderEditorLineNumbers();
+    });
+  }
+
+  function getVisibleResizableHeight(element) {
+    if (!element?.isConnected || !element.getClientRects?.().length) {
+      return null;
+    }
+    const height = element.getBoundingClientRect?.().height;
+    return sanitizeEditorHeight(height);
+  }
+
+  function scheduleEditorHeightSave() {
+    if (editorHeightSaveTimer) {
+      clearTimeout(editorHeightSaveTimer);
+    }
+    editorHeightSaveTimer = window.setTimeout(() => {
+      editorHeightSaveTimer = null;
+      void saveSelectorState({ reason: "resize-editor-heights" });
+    }, EDITOR_HEIGHT_SAVE_DELAY_MS);
+  }
+
+  function captureEditorHeightsFromDom({ save = true, fields = null } = {}) {
+    const scrollTop = getPanelBodyScrollTop();
+    const previous = sanitizeEditorHeights(selectorState.editorHeights);
+    const next = { ...previous };
+    const shouldCaptureGroupsDefinition = !fields || fields.includes("groupsDefinition");
+    const shouldCaptureQuickPrompt = !fields || fields.includes("quickPrompt");
+    const groupsDefinitionHeight = shouldCaptureGroupsDefinition
+      ? getVisibleResizableHeight(ui.editorShell)
+      : null;
+    const quickPromptHeight = shouldCaptureQuickPrompt
+      ? getVisibleResizableHeight(ui.quickInput)
+      : null;
+
+    if (groupsDefinitionHeight) {
+      next.groupsDefinition = groupsDefinitionHeight;
+    }
+    if (quickPromptHeight) {
+      next.quickPrompt = quickPromptHeight;
+    }
+    if (
+      next.groupsDefinition === previous.groupsDefinition
+      && next.quickPrompt === previous.quickPrompt
+    ) {
+      return;
+    }
+
+    selectorState.editorHeights = next;
+    restorePanelBodyScrollTop(scrollTop);
+    if (save) {
+      scheduleEditorHeightSave();
+    }
+  }
+
+  function getEditorResizeTargetFromEvent(event) {
+    const path = typeof event.composedPath === "function" ? event.composedPath() : [];
+    if (path.includes(ui.editorShell)) {
+      return { field: "groupsDefinition", element: ui.editorShell };
+    }
+    if (path.includes(ui.quickInput)) {
+      return { field: "quickPrompt", element: ui.quickInput };
+    }
+    return null;
+  }
+
+  function startEditorResizeInteraction(event) {
+    if (event.button != null && event.button !== 0) {
+      return;
+    }
+    const target = getEditorResizeTargetFromEvent(event);
+    const height = getVisibleResizableHeight(target?.element);
+    if (!target || !height) {
+      return;
+    }
+    editorResizeInteraction = {
+      field: target.field,
+      element: target.element,
+      startHeight: height,
+    };
+  }
+
+  function finishEditorResizeInteraction() {
+    const interaction = editorResizeInteraction;
+    editorResizeInteraction = null;
+    if (!interaction?.element) {
+      return;
+    }
+    const nextHeight = getVisibleResizableHeight(interaction.element);
+    if (!nextHeight || Math.abs(nextHeight - interaction.startHeight) <= EDITOR_RESIZE_HEIGHT_THRESHOLD_PX) {
+      return;
+    }
+
+    suppressEditorResizeClickUntil = Date.now() + EDITOR_RESIZE_CLICK_SUPPRESS_MS;
+    captureEditorHeightsFromDom({ fields: [interaction.field] });
+  }
+
+  function suppressClickAfterEditorResize(event) {
+    if (Date.now() > suppressEditorResizeClickUntil) {
+      return;
+    }
+    suppressEditorResizeClickUntil = 0;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+  }
+
   function updateEditorFieldsFromActiveSlot() {
     if (!ui.editor || !ui.quickInput) {
       return;
@@ -4292,6 +4463,7 @@
 
   function refreshPanelFromSelectorState() {
     updateEditorFieldsFromActiveSlot();
+    applyEditorHeightsFromState();
     renderSlotButtons();
     renderPromptSelector();
   }
@@ -4386,6 +4558,7 @@
   }
 
   function bindPanelEvents() {
+    panelShadow.addEventListener("click", suppressClickAfterEditorResize, true);
     ui.shell.addEventListener("wheel", blockPanelCtrlWheelZoom, { passive: false });
 
     bindCollapsedCardDrag();
@@ -4408,10 +4581,48 @@
     });
 
     ui.editor.addEventListener("scroll", syncEditorLineNumbersScroll);
+    ui.editorShell.addEventListener("pointerdown", startEditorResizeInteraction, true);
+    ui.editorShell.addEventListener("mousedown", startEditorResizeInteraction, true);
+    ui.editorShell.addEventListener("pointerup", () => {
+      captureEditorHeightsFromDom({ fields: ["groupsDefinition"] });
+    });
+    ui.quickInput.addEventListener("pointerdown", startEditorResizeInteraction, true);
+    ui.quickInput.addEventListener("mousedown", startEditorResizeInteraction, true);
+    ui.quickInput.addEventListener("pointerup", () => {
+      captureEditorHeightsFromDom({ fields: ["quickPrompt"] });
+    });
+    window.addEventListener("pointerup", finishEditorResizeInteraction, true);
+    window.addEventListener("mouseup", finishEditorResizeInteraction, true);
+    window.addEventListener("pointercancel", () => {
+      editorResizeInteraction = null;
+    }, true);
 
     if (window.ResizeObserver && ui.editorShell) {
-      ui.editorResizeObserver = new ResizeObserver(() => renderEditorLineNumbers());
+      let editorShellResizePrimed = false;
+      ui.editorResizeObserver = new ResizeObserver(() => {
+        preservePanelBodyScroll(() => {
+          renderEditorLineNumbers();
+          if (!editorShellResizePrimed) {
+            editorShellResizePrimed = true;
+            return;
+          }
+          captureEditorHeightsFromDom({ fields: ["groupsDefinition"] });
+        });
+      });
       ui.editorResizeObserver.observe(ui.editorShell);
+    }
+    if (window.ResizeObserver && ui.quickInput) {
+      let quickResizePrimed = false;
+      ui.quickResizeObserver = new ResizeObserver(() => {
+        preservePanelBodyScroll(() => {
+          if (!quickResizePrimed) {
+            quickResizePrimed = true;
+            return;
+          }
+          captureEditorHeightsFromDom({ fields: ["quickPrompt"] });
+        });
+      });
+      ui.quickResizeObserver.observe(ui.quickInput);
     }
 
     ui.quickInput.addEventListener("input", () => {
@@ -5065,6 +5276,7 @@
         .nps-body {
           min-height: 0;
           overflow: auto;
+          overflow-anchor: none;
           padding: 12px;
           display: flex;
           flex-direction: column;
@@ -5183,6 +5395,7 @@
           border-color: rgba(255, 149, 118, 0.5) !important;
         }
         .nps-editor-shell {
+          overflow-anchor: none;
           position: relative;
           width: 100%;
           height: 132px;
@@ -5256,6 +5469,7 @@
           word-break: break-word;
         }
         .nps-quick {
+          overflow-anchor: none;
           width: 100%;
           min-height: 132px;
           resize: vertical;
@@ -6588,6 +6802,7 @@
       preview: panelShadow.querySelector(".nps-preview"),
       promptMeta: panelShadow.querySelector(".nps-prompt-meta"),
       status: panelShadow.querySelector(".nps-status"),
+      body: panelShadow.querySelector(".nps-body"),
       copyButton: panelShadow.querySelector(".nps-copy"),
       applyButton: panelShadow.querySelector(".nps-apply"),
       applyAllButton: panelShadow.querySelector(".nps-apply-all"),
@@ -6617,6 +6832,7 @@
     refreshSlotsFromDom();
     void loadAutoSettingsIntoPanel();
     updateEditorFieldsFromActiveSlot();
+    applyEditorHeightsFromState();
     applyPanelPosition();
     setPanelCollapsed(selectorState.panelCollapsed);
     bindPanelEvents();
@@ -6852,6 +7068,12 @@
     if (statusTimer) {
       clearInterval(statusTimer);
       statusTimer = null;
+    }
+    if (editorHeightSaveTimer) {
+      clearTimeout(editorHeightSaveTimer);
+      editorHeightSaveTimer = null;
+      captureEditorHeightsFromDom({ save: false });
+      void saveSelectorState({ reason: "resize-editor-heights" });
     }
   });
 
